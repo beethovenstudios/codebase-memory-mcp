@@ -1128,8 +1128,26 @@ TEST(cgroup_no_mem_files) {
 
 #endif /* __linux__ */
 
+/* A written file flushes; a missing one, or none, reports failure. */
+TEST(platform_flush_file_to_disk) {
+    char path[512];
+    snprintf(path, sizeof(path), "%s/cbm_flush_%d.bin", cbm_tmpdir(), (int)getpid());
+    FILE *f = cbm_fopen(path, "wb");
+    ASSERT_NOT_NULL(f);
+    fputs("pages to write out\n", f);
+    fclose(f);
+    int written = cbm_flush_file_to_disk(path);
+    unlink(path);
+    int missing = cbm_flush_file_to_disk(path);
+    ASSERT_EQ(written, 0);
+    ASSERT(missing != 0);
+    ASSERT(cbm_flush_file_to_disk(NULL) != 0);
+    PASS();
+}
+
 SUITE(platform) {
     RUN_TEST(platform_file_apis_survive_max_path_overflow);
+    RUN_TEST(platform_flush_file_to_disk);
     RUN_TEST(platform_mkdir_p_follows_own_symlink_only_when_opted_in);
     RUN_TEST(platform_mkdir_p_symlink_trust_is_bounded_by_owner_and_mode);
     RUN_TEST(platform_mkdir_p_follow_owned_is_per_call_site);

@@ -542,7 +542,8 @@ int64_t cbm_store_resolve_mmap_size(void) {
  *                and would (a) mutate the DB on every read query and (b)
  *                fail on a read-only DB file / filesystem.
  * in_memory and read_only are mutually exclusive. */
-static int configure_pragmas(cbm_store_t *s, bool in_memory, bool read_only) {
+static int configure_pragmas(cbm_store_t *s, bool in_memory, bool read_only,
+                             bool unsynced_staging) {
     int rc;
     rc = exec_sql(s, "PRAGMA foreign_keys = ON;");
     if (rc != CBM_STORE_OK) {
@@ -570,6 +571,14 @@ static int configure_pragmas(cbm_store_t *s, bool in_memory, bool read_only) {
         if (rc != CBM_STORE_OK) {
             return rc;
         }
+        /* A staging copy switches to WAL with nothing synced: see
+         * cbm_store_open_staging. */
+        if (unsynced_staging) {
+            rc = exec_sql(s, "PRAGMA synchronous = OFF;");
+            if (rc != CBM_STORE_OK) {
+                return rc;
+            }
+        }
         rc = exec_sql(s, "PRAGMA journal_mode = WAL;");
         if (rc != CBM_STORE_OK) {
             return rc;
@@ -578,7 +587,8 @@ static int configure_pragmas(cbm_store_t *s, bool in_memory, bool read_only) {
          * PASSIVE never blocks readers and never ftruncates.
          * May fail with SQLITE_BUSY if another process holds a lock. */
         (void)sqlite3_exec(s->db, "PRAGMA wal_checkpoint(PASSIVE)", NULL, NULL, NULL);
-        rc = exec_sql(s, "PRAGMA synchronous = NORMAL;");
+        rc = exec_sql(s, unsynced_staging ? "PRAGMA synchronous = OFF;"
+                                          : "PRAGMA synchronous = NORMAL;");
         if (rc != CBM_STORE_OK) {
             return rc;
         }
@@ -801,7 +811,8 @@ static int store_authorizer(void *user_data, int action, const char *p3, const c
     }
 }
 
-static cbm_store_t *store_open_internal(const char *path, bool in_memory, bool create) {
+static cbm_store_t *store_open_internal(const char *path, bool in_memory, bool create,
+                                        bool unsynced_staging) {
     cbm_store_t *s = calloc(CBM_ALLOC_ONE, sizeof(cbm_store_t));
     if (!s) {
         return NULL;
@@ -849,7 +860,8 @@ static cbm_store_t *store_open_internal(const char *path, bool in_memory, bool c
     sqlite3_create_function(s->db, "cbm_camel_split", SKIP_ONE, SQLITE_UTF8 | SQLITE_DETERMINISTIC,
                             NULL, sqlite_camel_split, NULL, NULL);
 
-    if (configure_pragmas(s, in_memory, false) != CBM_STORE_OK || init_schema(s) != CBM_STORE_OK ||
+    if (configure_pragmas(s, in_memory, false, unsynced_staging) != CBM_STORE_OK ||
+        init_schema(s) != CBM_STORE_OK ||
         create_user_indexes(s) != CBM_STORE_OK) {
         sqlite3_close(s->db);
         safe_str_free(&s->db_path);
@@ -879,21 +891,28 @@ static cbm_store_t *store_open_internal(const char *path, bool in_memory, bool c
  * Must run before SQLite initialises, so it is done once on the first open. */
 
 cbm_store_t *cbm_store_open_memory(void) {
-    return store_open_internal(":memory:", true, true);
+    return store_open_internal(":memory:", true, true, false);
 }
 
 cbm_store_t *cbm_store_open_path(const char *db_path) {
     if (!db_path) {
         return NULL;
     }
-    return store_open_internal(db_path, false, true);
+    return store_open_internal(db_path, false, true, false);
 }
 
 cbm_store_t *cbm_store_open_path_existing(const char *db_path) {
     if (!db_path) {
         return NULL;
     }
-    return store_open_internal(db_path, false, false);
+    return store_open_internal(db_path, false, false, false);
+}
+
+cbm_store_t *cbm_store_open_staging(const char *db_path) {
+    if (!db_path) {
+        return NULL;
+    }
+    return store_open_internal(db_path, false, false, true);
 }
 
 const char *cbm_store_db_path(const cbm_store_t *s) {
@@ -1037,7 +1056,7 @@ cbm_store_t *cbm_store_open_path_query(const char *db_path) {
     sqlite3_create_function(s->db, "cbm_camel_split", SKIP_ONE, SQLITE_UTF8 | SQLITE_DETERMINISTIC,
                             NULL, sqlite_camel_split, NULL, NULL);
 
-    if (configure_pragmas(s, false, true) != CBM_STORE_OK) {
+    if (configure_pragmas(s, false, true, false) != CBM_STORE_OK) {
         sqlite3_close(s->db);
         safe_str_free(&s->db_path);
         free(s);
@@ -1240,7 +1259,7 @@ cbm_store_t *cbm_store_open(const char *project) {
     }
     char path[CBM_SZ_1K];
     snprintf(path, sizeof(path), "%s/%s.db", cdir, project);
-    return store_open_internal(path, false, true);
+    return store_open_internal(path, false, true, false);
 }
 
 static void finalize_stmt(sqlite3_stmt **s) {

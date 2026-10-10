@@ -1423,3 +1423,34 @@ int cbm_clone_or_copy_file(const char *src, const char *dst) {
 #endif
     return stream_copy_file(src, dst);
 }
+
+int cbm_flush_file_to_disk(const char *path) {
+    if (!path) {
+        return CBM_NOT_FOUND;
+    }
+#ifdef _WIN32
+    wchar_t *wpath = cbm_path_to_wide(path);
+    if (!wpath) {
+        return CBM_NOT_FOUND;
+    }
+    /* FlushFileBuffers needs write access; the sharing flags leave every
+     * other handle on the file (the store's own) undisturbed. */
+    HANDLE h = CreateFileW(wpath, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    free(wpath);
+    if (h == INVALID_HANDLE_VALUE) {
+        return CBM_NOT_FOUND;
+    }
+    BOOL flushed = FlushFileBuffers(h);
+    CloseHandle(h);
+    return flushed ? 0 : CBM_NOT_FOUND;
+#else
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        return CBM_NOT_FOUND;
+    }
+    int rc = fsync(fd);
+    (void)close(fd);
+    return rc == 0 ? 0 : CBM_NOT_FOUND;
+#endif
+}

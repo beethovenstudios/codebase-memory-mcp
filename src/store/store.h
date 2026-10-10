@@ -351,6 +351,15 @@ cbm_store_t *cbm_store_open_path(const char *db_path);
  * a ghost database. Returns NULL when the file does not exist. */
 cbm_store_t *cbm_store_open_path_existing(const char *db_path);
 
+/* Open an existing staging copy that this process alone writes and throws
+ * away on any failure. No write waits for the disk: synchronous is OFF, set
+ * BEFORE the switch to WAL, because that switch commits a header change and,
+ * under any stronger setting, syncs the whole file. On a fresh copy that is
+ * every page of the store, written out before the first query runs.
+ * cbm_store_seal_for_atomic_publish restores FULL before anything is
+ * published, so a published store is exactly as durable as before. */
+cbm_store_t *cbm_store_open_staging(const char *db_path);
+
 /* Open an existing file-backed database for querying only. Opened READ-ONLY
  * (no SQLITE_OPEN_CREATE, no write pragmas) so queries never mutate the DB and
  * work on a read-only file / filesystem. Returns NULL if the file does not

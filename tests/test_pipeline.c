@@ -3400,6 +3400,38 @@ TEST(pipeline_closure_repair_added_names_off) {
  * (about 2 files, but the eight-file floor still applies and 11 clears it). A
  * file nobody names would never reach the budget at any percentage, which is
  * why these callees are named by ten files each. */
+/* A new file's base name counts only where all of its pieces are spelled:
+ * twelve files using a variable "b" do not join for "widget-b", the file
+ * that includes it does, and the closure stays inside the budget. */
+TEST(pipeline_closure_base_name_needs_every_piece) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_closure_whole_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    for (int i = 0; i < 12; i++) {
+        char name[32];
+        char body[96];
+        snprintf(name, sizeof(name), "use_b_%02d.c", i);
+        snprintf(body, sizeof(body), "int use_b_%02d(int b) {\n    return b + %d;\n}\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+    write_temp_file(tmp, "main.c",
+                    "#include \"lib/widget-b.h\"\n\nint main(void) {\n    return 0;\n}\n");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/closure.db", tmp);
+    char project[256];
+    ASSERT_GTE(closure_run(tmp, db, project, sizeof(project)), 0);
+
+    write_temp_file(tmp, "lib/widget-b.h", "int widget_limit(void) {\n    return 4;\n}\n");
+    int route = closure_run_repair_on(tmp, db);
+    closure_diff_t diff;
+    int verdict = closure_graph_vs_full(tmp, db, project, &diff);
+    th_rmtree(tmp);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    closure_report_diff(verdict, &diff);
+    ASSERT_EQ(verdict, 0);
+    PASS();
+}
+
 TEST(pipeline_closure_budget_percent_setting) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_closure_pct_XXXXXX");
@@ -15348,6 +15380,7 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(pipeline_closure_store_without_blooms_rebuilds_once);
     RUN_TEST(pipeline_closure_repair_added_names_off);
     RUN_TEST(pipeline_closure_budget_percent_setting);
+    RUN_TEST(pipeline_closure_base_name_needs_every_piece);
     RUN_TEST(pipeline_incremental_tsconfig_alias_change_matches_fresh_full);
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
     RUN_TEST(pipeline_publication_stamps_full_and_delta_generations);

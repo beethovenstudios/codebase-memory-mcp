@@ -11,6 +11,7 @@
 #include "test_framework.h"
 #include "test_helpers.h"
 #include <store/store.h>
+#include "sqlite3.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -262,7 +263,56 @@ TEST(corrupt_page_scan_returns_error_not_truncation) {
     PASS();
 }
 
+/* One pragma's value as text, from the store's own connection. */
+static void staging_pragma_text(cbm_store_t *s, const char *sql, char *out, size_t cap) {
+    out[0] = '\0';
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(cbm_store_get_db(s), sql, -1, &stmt, NULL) == SQLITE_OK &&
+        sqlite3_step(stmt) == SQLITE_ROW) {
+        const unsigned char *v = sqlite3_column_text(stmt, 0);
+        snprintf(out, cap, "%s", v ? (const char *)v : "");
+    }
+    sqlite3_finalize(stmt);
+}
+
+/* A staging copy is opened in WAL with nothing synced, and never created;
+ * the ordinary open keeps synchronous NORMAL. */
+TEST(store_open_staging_never_syncs) {
+    char tmp_path[256];
+    snprintf(tmp_path, sizeof(tmp_path), "%s/cbm_test_stage_%d.db", cbm_tmpdir(), (int)getpid());
+    unlink(tmp_path);
+    cbm_store_t *missing = cbm_store_open_staging(tmp_path);
+
+    char ordinary_sync[32];
+    cbm_store_t *s = cbm_store_open_path(tmp_path);
+    ASSERT(s != NULL);
+    staging_pragma_text(s, "PRAGMA synchronous", ordinary_sync, sizeof(ordinary_sync));
+    cbm_store_close(s);
+
+    char staging_sync[32];
+    char staging_mode[32];
+    s = cbm_store_open_staging(tmp_path);
+    ASSERT(s != NULL);
+    staging_pragma_text(s, "PRAGMA synchronous", staging_sync, sizeof(staging_sync));
+    staging_pragma_text(s, "PRAGMA journal_mode", staging_mode, sizeof(staging_mode));
+    cbm_store_close(s);
+
+    unlink(tmp_path);
+    char tmp_wal[300];
+    char tmp_shm[300];
+    snprintf(tmp_wal, sizeof(tmp_wal), "%s-wal", tmp_path);
+    snprintf(tmp_shm, sizeof(tmp_shm), "%s-shm", tmp_path);
+    unlink(tmp_wal);
+    unlink(tmp_shm);
+    ASSERT(missing == NULL);
+    ASSERT_STR_EQ(ordinary_sync, "1");
+    ASSERT_STR_EQ(staging_sync, "0");
+    ASSERT_STR_EQ(staging_mode, "wal");
+    PASS();
+}
+
 SUITE(store_pragmas) {
+    RUN_TEST(store_open_staging_never_syncs);
     RUN_TEST(journal_size_limit_bounds_wal_issue1083);
     RUN_TEST(store_generation_tracks_mutations);
     RUN_TEST(store_generation_rejects_malformed_metadata_atomically);

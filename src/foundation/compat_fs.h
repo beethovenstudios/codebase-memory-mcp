@@ -101,6 +101,14 @@ int cbm_rename_replace(const char *src, const char *dst);
  * database this way, so the clone fast path is the difference between
  * milliseconds and seconds there. */
 int cbm_clone_or_copy_file(const char *src, const char *dst);
+/* Write every cached page of an existing file to the disk and wait for it
+ * (FlushFileBuffers on Windows, fsync elsewhere). Safe beside other handles
+ * writing the same file: only pages already written are promised. A copy
+ * made by cbm_clone_or_copy_file's streamed fallback sits in the cache
+ * until something flushes it; running this on a worker thread lets that
+ * write overlap other work instead of stalling the next sync. Returns 0 on
+ * success. */
+int cbm_flush_file_to_disk(const char *path);
 /* Move a regular file only when dst does not exist. Never overwrites dst.
  * Used for collision-safe evidence quarantine beside a database. */
 int cbm_rename_noreplace(const char *src, const char *dst);

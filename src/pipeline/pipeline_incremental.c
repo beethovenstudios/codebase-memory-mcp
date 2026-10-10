@@ -1263,10 +1263,18 @@ static int surface_collect_added_names(const char *stored_json, const char *fres
 
 /* A new file can be named by an import or include of its own base name (the
  * file name without its directory and extension), which no definition inside
- * it spells. Add that name's identifier tokens. Directory names and the
- * extension are left out on purpose: many unrelated files share them. The
- * tokens are interned in the same heap-keyed shape as every other name. */
-static void added_base_name_tokens(CBMHashTable *out, const char *rel_path) {
+ * it spells. Collect that name's identifier tokens into a set of their own.
+ * Directory names and the extension are left out on purpose: many unrelated
+ * files share them. A file that spells the base name holds every one of its
+ * tokens, so the bloom pass asks for all of them at once: a short piece (the
+ * "b" of "probe-b") is in nearly every file, the whole name rarely is. The
+ * tokens are interned in the same heap-keyed shape as every other name.
+ * Returns the set, or NULL when memory runs out. */
+static CBMHashTable *added_base_name_tokens(const char *rel_path) {
+    CBMHashTable *set = cbm_ht_create(CBM_SZ_16);
+    if (!set) {
+        return NULL;
+    }
     const char *base = strrchr(rel_path, '/');
     base = base ? base + 1 : rel_path;
     size_t len = strlen(base);
@@ -1274,7 +1282,32 @@ static void added_base_name_tokens(CBMHashTable *out, const char *rel_path) {
     if (dot && dot > base) {
         len = (size_t)(dot - base);
     }
-    cbm_ref_tokens_add_text(out, base, len);
+    cbm_ref_tokens_add_text(set, base, len);
+    return set;
+}
+
+/* Does one bloom hold every token of a set? `all` starts true and falls on
+ * the first token the bloom rules out; an unreadable bloom sets `unreadable`
+ * and stops the walk's effect, as everywhere else it is met. */
+typedef struct {
+    const void *bloom;
+    int bloom_len;
+    bool all;
+    bool unreadable;
+} bloom_all_query_t;
+
+static void bloom_all_visitor(const char *key, void *value, void *userdata) {
+    (void)value;
+    bloom_all_query_t *q = (bloom_all_query_t *)userdata;
+    if (!q->all || q->unreadable) {
+        return;
+    }
+    int verdict = cbm_ref_bloom_may_contain(q->bloom, q->bloom_len, key);
+    if (verdict < 0) {
+        q->unreadable = true;
+    } else if (verdict == 0) {
+        q->all = false;
+    }
 }
 
 /* An added name ending in "Attribute" may be spelled without the suffix
@@ -1788,6 +1821,10 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
      * added_names collects every name this delta introduces (heap-keyed). */
     bool *is_new = NULL;
     CBMHashTable *added_names = NULL;
+    /* One heap-keyed token set per new file's base name (see
+     * added_base_name_tokens); a stored file joins only holding all of one. */
+    CBMHashTable **base_names = NULL;
+    int n_base_names = 0;
     const char **probe_names = NULL;
     int n_probe_names = 0;
     int n_stems = 0;
@@ -1818,7 +1855,9 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
     changed_paths = (char **)calloc((size_t)fresh_count + (size_t)stored_count, sizeof(char *));
     is_new = (bool *)calloc((size_t)fresh_count + (size_t)stored_count, sizeof(bool));
     added_names = cbm_ht_create(CBM_SZ_64);
-    if (!changed_paths || !is_new || !added_names) {
+    base_names = (CBMHashTable **)calloc((size_t)fresh_count + (size_t)stored_count + 1,
+                                         sizeof(CBMHashTable *));
+    if (!changed_paths || !is_new || !added_names || !base_names) {
         decline = "alloc";
         goto done;
     }
@@ -1955,7 +1994,18 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
                 decline = "added_definition_names";
                 goto done;
             }
-            added_base_name_tokens(added_names, changed_paths[i]);
+            CBMHashTable *base = added_base_name_tokens(changed_paths[i]);
+            if (!base) {
+                free(dep_targets);
+                cbm_ht_free(rows_by_path);
+                decline = "alloc";
+                goto done;
+            }
+            if (cbm_ht_count(base) > 0) {
+                base_names[n_base_names++] = base;
+            } else {
+                surface_name_set_free(base); /* a name of punctuation alone */
+            }
             continue;
         }
         if (!stored_row) {
@@ -1997,13 +2047,13 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
     int n_added_names = (int)cbm_ht_count(added_names);
     int bloom_rows_tested = 0;
     int bloom_hits = 0;
-    if (n_added_names > 0) {
+    if (n_added_names > 0 || n_base_names > 0) {
         for (int i = 0; i < n_changed; i++) {
             if (!cbm_ht_get(closure_set, changed_paths[i])) {
                 cbm_ht_set(closure_set, changed_paths[i], changed_paths[i]);
             }
         }
-        probe_names = (const char **)calloc((size_t)n_added_names * 2, sizeof(char *));
+        probe_names = (const char **)calloc((size_t)n_added_names * 2 + 1, sizeof(char *));
         if (!probe_names) {
             free(dep_targets);
             decline = "alloc";
@@ -2051,6 +2101,18 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
                     break;
                 }
                 may_spell = verdict > 0;
+            }
+            for (int j = 0; j < n_base_names && !decline && !may_spell; j++) {
+                bloom_all_query_t q = {.bloom = row->ref_bloom,
+                                       .bloom_len = row->ref_bloom_len,
+                                       .all = true,
+                                       .unreadable = false};
+                cbm_ht_foreach(base_names[j], bloom_all_visitor, &q);
+                if (q.unreadable) {
+                    decline = "no_ref_bloom";
+                    break;
+                }
+                may_spell = q.all;
             }
             if (decline || !may_spell) {
                 continue;
@@ -2129,9 +2191,11 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
             plan->new_paths[plan->new_count++] = info->rel_path;
         }
     }
-    if (n_added_names > 0) {
+    if (n_added_names > 0 || n_base_names > 0) {
+        /* Four conversions: exactly the itoa_buf ring (see below). */
         cbm_log_info("incremental.closure_added_names", "names", itoa_buf(n_added_names),
-                     "bloom_hits", itoa_buf(bloom_hits), "rows", itoa_buf(bloom_rows_tested));
+                     "base_names", itoa_buf(n_base_names), "bloom_hits", itoa_buf(bloom_hits),
+                     "rows", itoa_buf(bloom_rows_tested));
     }
     /* Two calls, not one: itoa_buf recycles a four-slot ring, so six
      * conversions in a single call print two corrupted fields (observed:
@@ -2150,6 +2214,10 @@ done:
     free(changed_paths);
     free(is_new);
     surface_name_set_free(added_names);
+    for (int i = 0; i < n_base_names; i++) {
+        surface_name_set_free(base_names[i]);
+    }
+    free(base_names);
     if (probe_names) {
         /* The last n_stems entries are heap copies; the rest are borrowed
          * from added_names. */
@@ -2170,6 +2238,36 @@ done:
         return 0;
     }
     return 1;
+}
+
+/* The staging copy's write-out, on a worker thread (see run_closure_delta).
+ * A failed flush costs nothing but the overlap: the publish seal syncs the
+ * file regardless. */
+typedef struct {
+    const char *path; /* borrowed: the stage outlives the thread */
+    cbm_thread_t thread;
+} stage_flush_t;
+
+static void *stage_flush_main(void *arg) {
+    stage_flush_t *f = (stage_flush_t *)arg;
+    struct timespec t;
+    cbm_clock_gettime(CLOCK_MONOTONIC, &t);
+    int rc = cbm_flush_file_to_disk(f->path);
+    cbm_log_info("delta.stage_flush", "rc", itoa_buf(rc), "elapsed_ms",
+                 itoa_buf((int)elapsed_ms(t)));
+    return NULL;
+}
+
+/* Wait for the write-out, once; logs how long the route actually waited. */
+static void stage_flush_join(stage_flush_t *f, bool *running) {
+    if (!*running) {
+        return;
+    }
+    struct timespec t;
+    cbm_clock_gettime(CLOCK_MONOTONIC, &t);
+    (void)cbm_thread_join(&f->thread);
+    *running = false;
+    cbm_log_info("delta.stage_flush_wait", "elapsed_ms", itoa_buf((int)elapsed_ms(t)));
 }
 
 /* ── Delta-repair orchestration (closure route) ──────────────────
@@ -2208,14 +2306,23 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
     int manifest_count = 0;
     cbm_coverage_row_t *cov = NULL;
     int cov_n = 0;
+    stage_flush_t flush = {0};
+    bool flush_running = false;
 
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
     if (cbm_delta_stage_clone(db_path, &stage) != 0) {
         goto out;
     }
     cbm_log_info("delta.clone", "elapsed_ms", itoa_buf((int)elapsed_ms(t)));
+    /* A copy made without a filesystem clone is the whole store again, still
+     * in the page cache. Its write-out starts now, beside the repair, rather
+     * than at the first sync, where it would stall the route for as long as
+     * the disk takes (seconds on a spinning disk). The staging connection
+     * never syncs; the publish seal syncs once, by then with little left. */
+    flush.path = stage;
+    flush_running = cbm_thread_create(&flush.thread, 0, stage_flush_main, &flush) == 0;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
-    staging = cbm_store_open_path(stage);
+    staging = cbm_store_open_staging(stage);
     if (!staging) {
         goto out;
     }
@@ -2599,6 +2706,7 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
         };
         cbm_store_close(staging);
         staging = NULL;
+        stage_flush_join(&flush, &flush_running);
         cbm_clock_gettime(CLOCK_MONOTONIC, &t);
         result = cbm_pipeline_publish_staged(stage, &generation, false, true);
         cbm_log_info("delta.publish_total", "elapsed_ms", itoa_buf((int)elapsed_ms(t)));
@@ -2610,6 +2718,7 @@ out:
     if (staging) {
         cbm_store_close(staging);
     }
+    stage_flush_join(&flush, &flush_running); /* before the file can go */
     if (stage) {
         cbm_pipeline_discard_stage(stage);
         free(stage);
