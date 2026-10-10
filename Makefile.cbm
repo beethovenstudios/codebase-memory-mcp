@@ -278,6 +278,7 @@ EXTRACTION_SRCS = \
     $(CBM_DIR)/helpers.c \
     $(CBM_DIR)/result_compact.c \
     $(CBM_DIR)/result_spill.c \
+    $(CBM_DIR)/ref_bloom.c \
     $(CBM_DIR)/lang_specs.c \
     $(CBM_DIR)/macro_table.c \
     $(CBM_DIR)/iris_export_xml.c \
@@ -547,6 +548,7 @@ TEST_FOUNDATION_SRCS = \
 
 TEST_EXTRACTION_SRCS = \
     tests/test_extraction.c \
+    tests/test_ref_bloom.c \
     tests/test_extraction_inheritance.c \
     tests/test_extraction_imports.c \
     tests/test_parse_coverage.c \
