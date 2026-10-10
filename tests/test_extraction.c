@@ -14,6 +14,8 @@
 #include "macro_table.h"
 #include "result_spill.h"
 #include "pipeline/pass_lsp_cross.h"
+#include "pipeline/lsp_surface.h"
+#include "ref_bloom.h"
 #include "iris_export_xml.h"
 
 /* ── Helpers ───────────────────────────────────────────────────── */
@@ -7325,6 +7327,92 @@ TEST(extract_compact_is_idempotent_and_survives_empty_results) {
     PASS();
 }
 
+/* ── Referenced-name bloom on the extraction result ───────────────────── */
+
+/* A source that calls helper_alpha and mentions nowhere_word only in a
+ * comment; the bloom covers code identifiers, so comments must not feed it. */
+static const char *BLOOM_C_SRC = "/* nowhere_word is only ever written in this comment */\n"
+                                 "int helper_alpha(int x);\n"
+                                 "int run(int v) {\n"
+                                 "    return helper_alpha(v);\n"
+                                 "}\n";
+
+/* The checks every bloom case makes on a result. */
+static int bloom_checks_pass(const CBMFileResult *r) {
+    if (!r->ref_bloom || r->ref_bloom_len < 12) {
+        return 0;
+    }
+    return cbm_ref_bloom_may_contain(r->ref_bloom, r->ref_bloom_len, "helper_alpha") == 1 &&
+           cbm_ref_bloom_may_contain(r->ref_bloom, r->ref_bloom_len, "nowhere_word") == 0;
+}
+
+TEST(extract_result_carries_a_reference_bloom) {
+    CBMFileResult *r = extract(BLOOM_C_SRC, CBM_LANG_C, "t", "bloom.c");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_NOT_NULL(r->ref_bloom);
+    ASSERT(r->ref_bloom_len >= 12);
+    ASSERT_EQ(cbm_ref_bloom_may_contain(r->ref_bloom, r->ref_bloom_len, "helper_alpha"), 1);
+    ASSERT_EQ(cbm_ref_bloom_may_contain(r->ref_bloom, r->ref_bloom_len, "nowhere_word"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(extract_bloom_survives_compaction) {
+    CBMFileResult *r = extract(BLOOM_C_SRC, CBM_LANG_C, "t", "bloom.c");
+    ASSERT_NOT_NULL(r);
+    ASSERT_NOT_NULL(r->ref_bloom);
+    cbm_result_compact(r);
+    /* The blob was copied into the compacted block, so the checks read the
+     * relocated pointer. */
+    ASSERT_NOT_NULL(r->ref_bloom);
+    ASSERT(r->ref_bloom_len >= 12);
+    ASSERT(bloom_checks_pass(r));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(surface_row_takes_the_result_bloom) {
+    /* The result's bloom is set by hand so this case isolates the row
+     * builder: whatever the extraction put there, the row must hold its own
+     * heap copy of the same bytes. */
+    static const unsigned char fake_bloom[16] = {0xB1, 0x0F, 1,    0,    0,    0,    0,    64,
+                                                 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88};
+    CBMFileResult *r = extract("int f(void) { return 1; }\n", CBM_LANG_C, "t", "row.c");
+    ASSERT_NOT_NULL(r);
+    r->ref_bloom = fake_bloom;
+    r->ref_bloom_len = (int)sizeof(fake_bloom);
+
+    char rel_path[] = "row.c";
+    cbm_file_info_t file = {.path = rel_path, .rel_path = rel_path, .language = CBM_LANG_C};
+    CBMFileResult *cache[1] = {r};
+    cbm_lsp_surface_row_t *rows = NULL;
+    int row_count = 0;
+    ASSERT_EQ(cbm_lsp_surface_build_rows(NULL, "t", cache, &file, 1, NULL, NULL, &rows, &row_count),
+              0);
+    ASSERT_EQ(row_count, 1);
+    ASSERT_EQ(rows[0].ref_bloom_len, (int)sizeof(fake_bloom));
+    ASSERT_NOT_NULL(rows[0].ref_bloom);
+    ASSERT(rows[0].ref_bloom != (const void *)fake_bloom); /* its own copy */
+    ASSERT(memcmp(rows[0].ref_bloom, fake_bloom, sizeof(fake_bloom)) == 0);
+    cbm_store_free_lsp_surfaces(rows, row_count);
+
+    /* A result with no bloom leaves the row's bloom NULL. */
+    r->ref_bloom = NULL;
+    r->ref_bloom_len = 0;
+    rows = NULL;
+    row_count = 0;
+    ASSERT_EQ(cbm_lsp_surface_build_rows(NULL, "t", cache, &file, 1, NULL, NULL, &rows, &row_count),
+              0);
+    ASSERT_EQ(row_count, 1);
+    ASSERT(rows[0].ref_bloom == NULL);
+    ASSERT_EQ(rows[0].ref_bloom_len, 0);
+    cbm_store_free_lsp_surfaces(rows, row_count);
+
+    cbm_free_result(r);
+    PASS();
+}
+
 /* ── Result spill (result_spill.c): park -> load is a faithful round trip ── */
 
 TEST(extract_spill_round_trip_keeps_every_field) {
@@ -7488,6 +7576,9 @@ TEST(extract_walk_truncated_at_its_cpu_budget) {
 SUITE(extraction) {
     RUN_TEST(extract_compact_keeps_every_field_and_shrinks_the_arena);
     RUN_TEST(extract_compact_is_idempotent_and_survives_empty_results);
+    RUN_TEST(extract_result_carries_a_reference_bloom);
+    RUN_TEST(extract_bloom_survives_compaction);
+    RUN_TEST(surface_row_takes_the_result_bloom);
     RUN_TEST(extract_spill_round_trip_keeps_every_field);
     RUN_TEST(extract_lsp_skipped_when_parse_used_its_budget_share);
     RUN_TEST(extract_walk_truncated_at_its_cpu_budget);

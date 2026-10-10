@@ -575,6 +575,13 @@ typedef struct CBMFileResult {
     // by cbm_free_result(); ordinary single-file results leave these zeroed.
     struct CBMFileResult **owned_results;
     int owned_result_count;
+
+    // Referenced-name bloom: a small filter over every identifier the file's
+    // code mentions (comments excluded), kept in `arena`. A name the filter
+    // answers "no" for is certainly not referenced; "yes" may be a false
+    // positive. NULL, with length 0, when none was built.
+    const unsigned char *ref_bloom;
+    int ref_bloom_len;
 } CBMFileResult;
 
 // --- Enclosing function cache ---

@@ -281,6 +281,9 @@ static void cr_walk_call(cr_ctx_t *c, CBMCall *call) {
 }
 
 static void cr_walk(cr_ctx_t *c, CBMFileResult *r) {
+    // The referenced-name bloom: a blob, so compaction copies it and a spill
+    // reload shifts its pointer with the rest.
+    cr_blob(c, (const void **)&r->ref_bloom, (size_t)r->ref_bloom_len);
     cr_array(c, (void **)&r->defs.items, r->defs.count, sizeof(CBMDefinition));
     for (int i = 0; i < r->defs.count && r->defs.items; i++) {
         cr_walk_def(c, &r->defs.items[i]);

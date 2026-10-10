@@ -154,8 +154,21 @@ int cbm_lsp_surface_build_rows(const cbm_pipeline_ctx_t *ctx, const char *projec
         int start = def_starts ? def_starts[i] : 0;
         int end = def_starts ? def_starts[i + 1] : 0;
         char *json = surface_file_to_json(fr, all_defs ? all_defs + start : NULL, end - start);
+        /* The row keeps its own heap copy of the referenced-name bloom: the
+         * result (and its arena) is released just below. A result without a
+         * bloom leaves the row's bloom NULL. */
+        int bloom_len = fr->ref_bloom_len;
+        void *bloom_copy = NULL;
+        if (json && fr->ref_bloom && bloom_len > 0) {
+            bloom_copy = malloc((size_t)bloom_len);
+            if (bloom_copy) {
+                memcpy(bloom_copy, fr->ref_bloom, (size_t)bloom_len);
+            }
+        }
+        bool bloom_failed = fr->ref_bloom && bloom_len > 0 && !bloom_copy;
         cbm_pipeline_result_release(fr, loaded);
-        if (!json) {
+        if (!json || bloom_failed) {
+            free(json);
             cbm_store_free_lsp_surfaces(rows, n);
             return -1;
         }
@@ -166,9 +179,9 @@ int cbm_lsp_surface_build_rows(const cbm_pipeline_ctx_t *ctx, const char *projec
         r->rel_path = strdup(files[i].rel_path);
         r->surface_sha = strdup(sha);
         r->defs_json = json;
-        r->ref_bloom = NULL;
-        r->ref_bloom_len = 0;
         r->config_ctx = strdup("");
+        r->ref_bloom = bloom_copy;
+        r->ref_bloom_len = bloom_copy ? bloom_len : 0;
         if (!r->project || !r->rel_path || !r->surface_sha || !r->config_ctx) {
             n++;
             cbm_store_free_lsp_surfaces(rows, n);
