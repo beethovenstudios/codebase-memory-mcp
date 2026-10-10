@@ -17,6 +17,7 @@ enum { INCR_RING_BUF = 4, INCR_RING_MASK = 3, INCR_TS_BUF = 24 };
 #include <time.h>
 #include "pipeline/lsp_surface.h"
 #include "pipeline/pass_lsp_cross.h"
+#include "ref_bloom.h"
 #include "sqlite3.h"
 #include "yyjson/yyjson.h"
 #include "pipeline/pipeline_internal.h"
@@ -1062,11 +1063,18 @@ static void free_incremental_result_cache(CBMFileResult **cache, int count) {
  * it. Per-file extraction is a pure function of file content, so an
  * unchanged dependent can never be surface-changed in turn — the closure is
  * structurally depth-1 and needs no fixpoint. Every uncertain case declines
- * to a FULL rebuild: new files, added definition names (yesterday's graph
- * cannot know tomorrow's referencers), virtual/config manifest entries,
- * missing or unreadable surface rows, dependents outside discovery, or a
- * closure above the budget. Declining is never wrong — it is exactly
- * today's behaviour. */
+ * to a FULL rebuild: virtual/config manifest entries, missing or unreadable
+ * surface rows, dependents outside discovery, or a closure above the budget.
+ * Declining is never wrong — it is exactly today's behaviour.
+ *
+ * With CBM_REPAIR_ADDED_NAMES=1, new files and added definition names are
+ * repaired rather than declined; otherwise they decline, as above.
+ * Yesterday's graph cannot know who would now resolve to a name that did not
+ * exist, but each stored surface row carries a bloom filter of every name its
+ * file mentions, so the files that may spell an added name are found without
+ * re-reading anything. They join the closure, and the repair re-resolves them
+ * exactly as a full build would. A stored row with no usable bloom (a store
+ * written before blooms existed) declines once; that rebuild writes them. */
 
 enum {
     CLOSURE_BUDGET_PERCENT = 30,
@@ -1075,7 +1083,33 @@ enum {
      * always worth attempting; the percentage governs at scale, where it is
      * the honest signal that a rebuild costs less than a repair. */
     CLOSURE_BUDGET_FLOOR_FILES = 8,
+    CLOSURE_BUDGET_PERCENT_MAX = 100,
 };
+
+/* Both settings are read on every call, as the engine reads its other CBM_*
+ * tuning, so a change to the environment applies to the next index run. */
+
+/* The added-name repair is opt-in: only CBM_REPAIR_ADDED_NAMES=1 turns it on.
+ * Unset, "0", empty or anything else leaves it off, and a new file or an added
+ * definition name declines to a full rebuild as it always has. */
+static bool closure_repair_added_names_enabled(void) {
+    const char *value = getenv("CBM_REPAIR_ADDED_NAMES");
+    return value && strcmp(value, "1") == 0;
+}
+
+/* CBM_CLOSURE_BUDGET_PERCENT when it holds a whole number from 1 to 100,
+ * otherwise the built-in budget. The eight-file floor is not configurable. */
+static int closure_budget_percent(void) {
+    const char *value = getenv("CBM_CLOSURE_BUDGET_PERCENT");
+    if (value && value[0]) {
+        char *end = NULL;
+        long parsed = strtol(value, &end, 10);
+        if (end && *end == '\0' && parsed >= 1 && parsed <= CLOSURE_BUDGET_PERCENT_MAX) {
+            return (int)parsed;
+        }
+    }
+    return CLOSURE_BUDGET_PERCENT;
+}
 
 typedef struct {
     /* Deserialized surfaces of the files NOT being re-parsed, registered
@@ -1104,12 +1138,20 @@ typedef struct {
     int count;
     int n_changed;
     int n_dependents;
+    /* The files in `files` that did not exist in the previous generation.
+     * The repair gives each the containment a full build would (its File
+     * node, its Folder chain and the edges between them), because the
+     * snapshot it keeps containment from has nothing for a new file. Heap
+     * array of strings borrowed from the discovery array, like `files`. */
+    const char **new_paths;
+    int new_count;
     cbm_lsp_surface_row_t *stored_rows; /* whole previous generation */
     int stored_count;
 } closure_plan_t;
 
 static void closure_plan_free(closure_plan_t *plan) {
     free(plan->files);
+    free((void *)plan->new_paths);
     cbm_store_free_lsp_surfaces(plan->stored_rows, plan->stored_count);
     memset(plan, 0, sizeof(*plan));
 }
@@ -1165,36 +1207,90 @@ static void surface_name_set_free(CBMHashTable *set) {
     cbm_ht_free(set);
 }
 
-typedef struct {
-    CBMHashTable *stored_set;
-    bool added;
-} surface_added_check_t;
+/* Add `name` to a heap-keyed name set (the shape surface_name_set builds and
+ * surface_name_set_free releases) unless it is already there. Returns false
+ * only when the copy could not be allocated. */
+static bool name_set_add(CBMHashTable *set, const char *name) {
+    if (cbm_ht_get(set, name)) {
+        return true;
+    }
+    char *copy = strdup(name);
+    if (!copy) {
+        return false;
+    }
+    cbm_ht_set(set, copy, copy);
+    return true;
+}
 
-static void surface_added_visitor(const char *key, void *value, void *userdata) {
+typedef struct {
+    CBMHashTable *other; /* names to leave out (may be NULL: leave out none) */
+    CBMHashTable *out;   /* receives every visited name absent from `other` */
+    bool failed;
+} name_set_diff_t;
+
+static void name_set_diff_visitor(const char *key, void *value, void *userdata) {
     (void)value;
-    surface_added_check_t *check = (surface_added_check_t *)userdata;
-    if (!check->added && !cbm_ht_get(check->stored_set, key)) {
-        check->added = true;
+    name_set_diff_t *diff = (name_set_diff_t *)userdata;
+    if (diff->failed || (diff->other && cbm_ht_get(diff->other, key))) {
+        return;
+    }
+    if (!name_set_add(diff->out, key)) {
+        diff->failed = true;
     }
 }
 
-/* Does `fresh_json` define any short name absent from `stored_json`? An
+/* Add to `out` every short name `fresh_json` defines that `stored_json` does
+ * not (stored_json NULL: every name). Returns 0, or -1 when a surface cannot
+ * be read or memory runs out; the caller then declines to a full rebuild. An
  * added name can re-route references in files that have NO edge into this
  * file yet (call-the-helper-you-just-wrote, shadowing), which the
- * edge-derived dependent set cannot see — those cases go to FULL. */
-static int surface_added_names(const char *stored_json, const char *fresh_json, bool *out_added) {
-    *out_added = true; /* fail closed */
-    CBMHashTable *stored_set = surface_name_set(stored_json);
+ * edge-derived dependent set cannot see; the caller finds those files by
+ * their blooms. */
+static int surface_collect_added_names(const char *stored_json, const char *fresh_json,
+                                       CBMHashTable *out) {
+    CBMHashTable *stored_set = stored_json ? surface_name_set(stored_json) : NULL;
     CBMHashTable *fresh_set = surface_name_set(fresh_json);
-    int rc = (stored_set && fresh_set) ? 0 : -1;
+    int rc = (fresh_set && (stored_set || !stored_json)) ? 0 : -1;
     if (rc == 0) {
-        surface_added_check_t check = {.stored_set = stored_set, .added = false};
-        cbm_ht_foreach(fresh_set, surface_added_visitor, &check);
-        *out_added = check.added;
+        name_set_diff_t diff = {.other = stored_set, .out = out, .failed = false};
+        cbm_ht_foreach(fresh_set, name_set_diff_visitor, &diff);
+        rc = diff.failed ? -1 : 0;
     }
     surface_name_set_free(stored_set);
     surface_name_set_free(fresh_set);
     return rc;
+}
+
+/* A new file can be named by an import or include of its own base name (the
+ * file name without its directory and extension), which no definition inside
+ * it spells. Add that name's identifier tokens. Directory names and the
+ * extension are left out on purpose: many unrelated files share them. The
+ * tokens are interned in the same heap-keyed shape as every other name. */
+static void added_base_name_tokens(CBMHashTable *out, const char *rel_path) {
+    const char *base = strrchr(rel_path, '/');
+    base = base ? base + 1 : rel_path;
+    size_t len = strlen(base);
+    const char *dot = strrchr(base, '.');
+    if (dot && dot > base) {
+        len = (size_t)(dot - base);
+    }
+    cbm_ref_tokens_add_text(out, base, len);
+}
+
+/* An added name ending in "Attribute" may be spelled without the suffix
+ * (the C# attribute convention); probe the shorter name as well. */
+#define ATTRIBUTE_SUFFIX "Attribute"
+enum { ATTRIBUTE_SUFFIX_LEN = sizeof(ATTRIBUTE_SUFFIX) - 1 };
+
+typedef struct {
+    const char **names; /* borrowed from the set */
+    int count;
+} name_list_t;
+
+static void name_list_visitor(const char *key, void *value, void *userdata) {
+    (void)value;
+    name_list_t *list = (name_list_t *)userdata;
+    list->names[list->count++] = key;
 }
 
 /* Run parallel or sequential extract+resolve for changed files. Any failure
@@ -1688,6 +1784,14 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
     int probe_count = 0;
     cbm_file_info_t *probe_files = NULL;
     cbm_path_alias_collection_t *plan_aliases = NULL;
+    /* is_new[i] marks changed_paths[i] as a file with no stored manifest row;
+     * added_names collects every name this delta introduces (heap-keyed). */
+    bool *is_new = NULL;
+    CBMHashTable *added_names = NULL;
+    const char **probe_names = NULL;
+    int n_probe_names = 0;
+    int n_stems = 0;
+    const bool repair_added_names = closure_repair_added_names_enabled();
     int n_changed = 0;
     int n_deleted = 0;
     if (!fresh_by_path || !files_by_path || !stored_by_path || !closure_set) {
@@ -1707,10 +1811,14 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
     /* Delta classification straight from the semantic manifests (content
      * hashes, not mtimes). Virtual entries are config/lockfile digests —
      * their effect on resolution is not file-local, so any delta there
-     * declines. New files decline: yesterday's graph cannot know who would
-     * reference a file that did not exist. */
+     * declines. A new file joins the changed files, marked new: yesterday's
+     * graph cannot know who would reference it, so the files that may spell
+     * its names are found later from their blooms (when the added-name
+     * repair is on; otherwise a new file declines). */
     changed_paths = (char **)calloc((size_t)fresh_count + (size_t)stored_count, sizeof(char *));
-    if (!changed_paths) {
+    is_new = (bool *)calloc((size_t)fresh_count + (size_t)stored_count, sizeof(bool));
+    added_names = cbm_ht_create(CBM_SZ_64);
+    if (!changed_paths || !is_new || !added_names) {
         decline = "alloc";
         goto done;
     }
@@ -1729,10 +1837,11 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
             goto done;
         }
         if (discovered) {
-            if (!old_row) {
+            if (!old_row && !repair_added_names) {
                 decline = "new_file";
                 goto done;
             }
+            is_new[n_changed] = !old_row;
             changed_paths[n_changed++] = (char *)fresh[i].rel_path;
             continue;
         }
@@ -1828,7 +1937,28 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
                 break;
             }
         }
-        if (!stored_row || !fresh_row) {
+        /* No fresh surface fails closed whether the file is new or not. */
+        if (!fresh_row) {
+            free(dep_targets);
+            cbm_ht_free(rows_by_path);
+            decline = "missing_surface_row";
+            goto done;
+        }
+        if (is_new[i]) {
+            /* Every name the new file defines, and its own base name, may now
+             * be what some unchanged file's reference resolves to. Nothing
+             * stored points at a file that did not exist, so it seeds no
+             * edge query; the bloom pass below finds who spells these. */
+            if (surface_collect_added_names(NULL, fresh_row->defs_json, added_names) != 0) {
+                free(dep_targets);
+                cbm_ht_free(rows_by_path);
+                decline = "added_definition_names";
+                goto done;
+            }
+            added_base_name_tokens(added_names, changed_paths[i]);
+            continue;
+        }
+        if (!stored_row) {
             free(dep_targets);
             cbm_ht_free(rows_by_path);
             decline = "missing_surface_row";
@@ -1837,9 +1967,14 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
         if (strcmp(stored_row->surface_sha, fresh_row->surface_sha) == 0) {
             continue; /* body edit: the file re-resolves, nobody else does */
         }
-        bool added = false;
-        if (surface_added_names(stored_row->defs_json, fresh_row->defs_json, &added) != 0 ||
-            added) {
+        /* The surface changed. Names it gained go to the bloom pass; with the
+         * added-name repair off, any gained name declines instead. Either way
+         * the file still seeds the edge query for the files already bound to
+         * what it defines. */
+        uint32_t names_before = cbm_ht_count(added_names);
+        if (surface_collect_added_names(stored_row->defs_json, fresh_row->defs_json,
+                                        added_names) != 0 ||
+            (!repair_added_names && cbm_ht_count(added_names) != names_before)) {
             free(dep_targets);
             cbm_ht_free(rows_by_path);
             decline = "added_definition_names";
@@ -1852,6 +1987,86 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
         dep_targets[dep_target_count++] = changed_paths[n_changed + i];
     }
     cbm_ht_free(rows_by_path);
+
+    /* Bloom pass: every stored row, not already in the closure, whose file may
+     * spell an added name joins the closure. Changed files are in it already
+     * (they are re-resolved whatever they mention). A deleted file's row is
+     * skipped: its nodes are purged, nothing is left to re-resolve. A bloom
+     * that is missing or unreadable cannot answer, so the whole plan declines
+     * (a store written before blooms existed rebuilds once and gains them). */
+    int n_added_names = (int)cbm_ht_count(added_names);
+    int bloom_rows_tested = 0;
+    int bloom_hits = 0;
+    if (n_added_names > 0) {
+        for (int i = 0; i < n_changed; i++) {
+            if (!cbm_ht_get(closure_set, changed_paths[i])) {
+                cbm_ht_set(closure_set, changed_paths[i], changed_paths[i]);
+            }
+        }
+        probe_names = (const char **)calloc((size_t)n_added_names * 2, sizeof(char *));
+        if (!probe_names) {
+            free(dep_targets);
+            decline = "alloc";
+            goto done;
+        }
+        name_list_t list = {.names = probe_names, .count = 0};
+        cbm_ht_foreach(added_names, name_list_visitor, &list);
+        n_probe_names = list.count;
+        /* Stems of "...Attribute" names are appended after the borrowed
+         * names; they are heap copies, freed at done. */
+        for (int i = 0; i < list.count; i++) {
+            size_t len = strlen(probe_names[i]);
+            if (len > ATTRIBUTE_SUFFIX_LEN &&
+                strcmp(probe_names[i] + len - ATTRIBUTE_SUFFIX_LEN, ATTRIBUTE_SUFFIX) == 0) {
+                size_t stem_len = len - ATTRIBUTE_SUFFIX_LEN;
+                char *stem = (char *)malloc(stem_len + 1);
+                if (!stem) {
+                    free(dep_targets);
+                    decline = "alloc";
+                    goto done;
+                }
+                memcpy(stem, probe_names[i], stem_len);
+                stem[stem_len] = '\0';
+                probe_names[n_probe_names++] = stem;
+                n_stems++;
+            }
+        }
+        for (int i = 0; i < plan->stored_count && !decline; i++) {
+            const cbm_lsp_surface_row_t *row = &plan->stored_rows[i];
+            if (cbm_ht_get(closure_set, row->rel_path) ||
+                !cbm_ht_get(fresh_by_path, row->rel_path)) {
+                continue;
+            }
+            bloom_rows_tested++;
+            if (!row->ref_bloom || row->ref_bloom_len <= 0) {
+                decline = "no_ref_bloom";
+                break;
+            }
+            bool may_spell = false;
+            for (int j = 0; j < n_probe_names && !may_spell; j++) {
+                int verdict = cbm_ref_bloom_may_contain(row->ref_bloom, row->ref_bloom_len,
+                                                        probe_names[j]);
+                if (verdict < 0) {
+                    decline = "no_ref_bloom";
+                    break;
+                }
+                may_spell = verdict > 0;
+            }
+            if (decline || !may_spell) {
+                continue;
+            }
+            if (!cbm_ht_get(files_by_path, row->rel_path)) {
+                decline = "dependent_not_discovered";
+                break;
+            }
+            cbm_ht_set(closure_set, row->rel_path, (void *)row->rel_path);
+            bloom_hits++;
+        }
+        if (decline) {
+            free(dep_targets);
+            goto done;
+        }
+    }
 
     if (dep_target_count > 0 &&
         cbm_store_get_dependent_files(store, project, dep_targets, dep_target_count, &dependents,
@@ -1883,7 +2098,7 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
      * the executor. */
     int closure_count = (int)cbm_ht_count(closure_set);
     if (closure_count > CLOSURE_BUDGET_FLOOR_FILES &&
-        closure_count * 100 > file_count * CLOSURE_BUDGET_PERCENT) {
+        closure_count * 100 > file_count * closure_budget_percent()) {
         decline = "budget_exceeded";
         goto done;
     }
@@ -1902,6 +2117,22 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
     }
     plan->n_changed = n_changed;
     plan->n_dependents = dependent_count;
+    plan->new_paths = (const char **)calloc((size_t)(n_changed ? n_changed : 1), sizeof(char *));
+    if (!plan->new_paths) {
+        free(plan->files);
+        decline = "alloc";
+        goto done;
+    }
+    for (int i = 0; i < n_changed; i++) {
+        if (is_new[i]) {
+            const cbm_file_info_t *info = cbm_ht_get(files_by_path, changed_paths[i]);
+            plan->new_paths[plan->new_count++] = info->rel_path;
+        }
+    }
+    if (n_added_names > 0) {
+        cbm_log_info("incremental.closure_added_names", "names", itoa_buf(n_added_names),
+                     "bloom_hits", itoa_buf(bloom_hits), "rows", itoa_buf(bloom_rows_tested));
+    }
     /* Two calls, not one: itoa_buf recycles a four-slot ring, so six
      * conversions in a single call print two corrupted fields (observed:
      * surface_changed reporting the elapsed-ms value at kernel scale). */
@@ -1917,6 +2148,16 @@ done:
     cbm_store_free_lsp_surfaces(probe_rows, probe_count);
     cbm_store_free_dependent_files(dependents, dependent_count);
     free(changed_paths);
+    free(is_new);
+    surface_name_set_free(added_names);
+    if (probe_names) {
+        /* The last n_stems entries are heap copies; the rest are borrowed
+         * from added_names. */
+        for (int i = n_probe_names - n_stems; i < n_probe_names; i++) {
+            free((void *)probe_names[i]);
+        }
+        free((void *)probe_names);
+    }
     cbm_ht_free(fresh_by_path);
     cbm_ht_free(files_by_path);
     cbm_ht_free(stored_by_path);
@@ -2163,6 +2404,24 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
             cbm_gbuf_upsert_node(gbuf, "File", basename, file_qn, rel, 0, 0, props);
             free(file_qn);
         }
+    }
+    /* A file that did not exist before is in no snapshot, so nothing carries
+     * its containment over. Build it the way a full build does, through the
+     * same functions: the File node, every Folder up its directory chain, and
+     * the CONTAINS_FOLDER / CONTAINS_FILE edges. Folders already stored are
+     * proxies in gbuf and are found by name, not duplicated; edges between
+     * two stored nodes are skipped by the patch, and the rest are inserted. */
+    if (plan->new_count > 0) {
+        cbm_pipeline_structure_roots(p, gbuf);
+        const char *root_qn = cbm_pipeline_structure_root_qn(p);
+        CBMHashTable *seen_dirs = cbm_ht_create(CBM_SZ_64);
+        if (!seen_dirs) {
+            goto out;
+        }
+        for (int i = 0; i < plan->new_count; i++) {
+            cbm_pipeline_structure_file(gbuf, project, root_qn, plan->new_paths[i], seen_dirs);
+        }
+        cbm_pipeline_structure_seen_free(seen_dirs);
     }
 
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
@@ -2562,6 +2821,17 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         free_mode_skipped(mode_skipped, mode_skipped_count);
         cbm_store_close(store);
         closure_plan_free(&closure_plan);
+        if (closure_active) {
+            /* A repair needs the previous coverage rows to carry forward, but
+             * a full rebuild does not, and it rewrites the damaged table. Fall
+             * back to it, as every other repair failure does; aborting would
+             * leave the store unreadable for coverage on every later run. */
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+            incr_test_set_last_route(CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+#endif
+            cbm_log_info("incremental.force_full", "reason", "coverage_unreadable");
+            return CBM_PIPELINE_FORCE_FULL_REINDEX;
+        }
         return CBM_PIPELINE_ABORT_PRESERVE_DB;
     }
 

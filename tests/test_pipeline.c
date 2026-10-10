@@ -2983,6 +2983,451 @@ TEST(pipeline_closure_repair_budget_declines_to_full) {
     PASS();
 }
 
+/* ── Closure repair when a file or a definition is added ─────────
+ *
+ * A name that did not exist yesterday can be spelled by files that did not
+ * change, so the planner must find them from what each stored surface row
+ * remembers it references. Every repair case below asserts BOTH the route
+ * and graph equality with a fresh full index of the same tree: a full rebuild
+ * would satisfy graph equality vacuously, and a wrong closure that still
+ * routes as a repair is the bug class the route alone cannot see. */
+
+/* Both edge types are a known incremental limitation: a repair never
+ * reproduces them, so the comparison skips them. The fixtures have no git
+ * history and no routes, so neither appears in them anyway. */
+static bool closure_edge_type_unrepaired(const char *type) {
+    return type && (strcmp(type, "FILE_CHANGES_WITH") == 0 || strcmp(type, "DATA_FLOWS") == 0);
+}
+
+typedef struct {
+    long long nodes;
+    long long edges;
+    char first[320]; /* the first difference found, for the failure message */
+} closure_diff_t;
+
+static bool closure_diff_on_node(void *context, bool added, const cbm_graph_node_identity_t *node) {
+    closure_diff_t *d = (closure_diff_t *)context;
+    if (d->nodes++ == 0 && d->edges == 0) {
+        snprintf(d->first, sizeof(d->first), "node %s the fresh full index: %s [%s]",
+                 added ? "only in" : "missing from", node->qualified_name, node->label);
+    }
+    return true;
+}
+
+static bool closure_diff_on_edge(void *context, bool added, const cbm_graph_edge_identity_t *edge) {
+    closure_diff_t *d = (closure_diff_t *)context;
+    if (closure_edge_type_unrepaired(edge->type)) {
+        return true;
+    }
+    if (d->edges++ == 0 && d->nodes == 0) {
+        snprintf(d->first, sizeof(d->first), "edge %s the fresh full index: %s -[%s]-> %s",
+                 added ? "only in" : "missing from", edge->source.qualified_name, edge->type,
+                 edge->target.qualified_name);
+    }
+    return true;
+}
+
+#define CLOSURE_DIFF_SCAN_LIMIT 100000
+
+/* Index the tree from nothing into its own database and diff the repaired
+ * database against it. scan_limit sits far above any fixture's node count.
+ * Returns 0 when the graphs agree, 1 when they differ (out->first says how),
+ * -1 when the comparison could not run or either graph is empty. */
+static int closure_graph_vs_full(const char *tmp, const char *repaired_db, const char *project,
+                                 closure_diff_t *out) {
+    memset(out, 0, sizeof(*out));
+    char full_db[512];
+    snprintf(full_db, sizeof(full_db), "%s/reference-full.db", tmp);
+    int nodes;
+    int edges;
+    int refs;
+    closure_fresh_full(tmp, full_db, &nodes, &edges, &refs, project);
+    if (nodes <= 0) {
+        return -1;
+    }
+    int verdict = -1;
+    cbm_store_t *repaired = cbm_store_open_path_query(repaired_db);
+    cbm_store_t *reference = cbm_store_open_path_query(full_db);
+    if (repaired && reference) {
+        cbm_graph_compare_result_t result = {0};
+        int rc = cbm_store_compare_graphs(repaired, project, reference, project,
+                                          CLOSURE_DIFF_SCAN_LIMIT, NULL, closure_diff_on_node,
+                                          closure_diff_on_edge, out, &result);
+        if (rc == CBM_STORE_OK && result.base.node_count > 0 && result.target.node_count > 0) {
+            verdict = (out->nodes > 0 || out->edges > 0) ? 1 : 0;
+        }
+    }
+    if (repaired) {
+        cbm_store_close(repaired);
+    }
+    if (reference) {
+        cbm_store_close(reference);
+    }
+    /* The case may index the tree again; the reference must not be in it. */
+    cbm_unlink(full_db);
+    cbm_remove_db_sidecars(full_db);
+    return verdict;
+}
+
+/* One pipeline run over an existing database. Returns the route it took, or
+ * -1 when the run itself failed. project, when given, receives the project
+ * name so the caller can name it in a comparison. */
+static int closure_run(const char *tmp, const char *db, char *project, size_t project_cap) {
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+    if (!p) {
+        return -1;
+    }
+    int rc = cbm_pipeline_run(p);
+    cbm_incremental_route_t route = cbm_pipeline_incremental_test_last_route();
+    if (project && project_cap > 0) {
+        snprintf(project, project_cap, "%s", cbm_pipeline_project_name(p));
+    }
+    cbm_pipeline_free(p);
+    return rc == 0 ? (int)route : -1;
+}
+
+/* Prints the first difference when a comparison failed, so a red run says what
+ * differed and not only that something did. */
+static void closure_report_diff(int verdict, const closure_diff_t *d) {
+    if (verdict == 1) {
+        printf("  graph difference: %s (nodes %lld, edges %lld)\n", d->first, d->nodes, d->edges);
+    }
+}
+
+/* Environment settings are process-wide; a case sets one, runs the pipeline
+ * with no assertion in between, and restores it before it asserts anything. */
+static char *closure_env_save(const char *name) {
+    const char *value = getenv(name);
+    return value ? strdup(value) : NULL;
+}
+
+static void closure_env_restore(const char *name, char *saved) {
+    if (saved) {
+        cbm_setenv(name, saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv(name);
+    }
+}
+
+/* A repair run: the added-name repair is opt-in (CBM_REPAIR_ADDED_NAMES=1), so
+ * every case that expects a new file or a new name to repair runs the pipeline
+ * through this, with the setting restored afterwards. */
+static int closure_run_repair_on(const char *tmp, const char *db) {
+    char *saved = closure_env_save("CBM_REPAIR_ADDED_NAMES");
+    cbm_setenv("CBM_REPAIR_ADDED_NAMES", "1", 1);
+    int route = closure_run(tmp, db, NULL, 0);
+    closure_env_restore("CBM_REPAIR_ADDED_NAMES", saved);
+    return route;
+}
+
+/* A body edit changes no name, so this repairs today. It calibrates the graph
+ * comparison on a case already known to repair: if it disagrees here, the
+ * comparison is at fault and no later verdict can be trusted. */
+TEST(pipeline_closure_repair_baseline_body_edit_equals_full) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_closure_base_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "a.c", "int once(int x) {\n    return x;\n}\n");
+    write_temp_file(tmp, "b.c", "int use_once(int x) {\n    return once(x);\n}\n");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/closure.db", tmp);
+    char project[256];
+    ASSERT_GTE(closure_run(tmp, db, project, sizeof(project)), 0);
+
+    write_temp_file(tmp, "a.c", "int once(int x) {\n    return x + 1;\n}\n");
+    int route = closure_run(tmp, db, NULL, 0);
+    closure_diff_t diff;
+    int verdict = closure_graph_vs_full(tmp, db, project, &diff);
+    th_rmtree(tmp);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    closure_report_diff(verdict, &diff);
+    ASSERT_EQ(verdict, 0);
+    PASS();
+}
+
+/* A call to a function defined nowhere is a reference with no target. The new
+ * file defines it: the unchanged caller must be found by the name it spells. */
+TEST(pipeline_closure_repair_new_file_named_by_a_call) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_closure_call_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "main.c", "int main(void) {\n    return helper();\n}\n");
+    write_temp_file(tmp, "other.c", "int other_value(void) {\n    return 3;\n}\n");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/closure.db", tmp);
+    char project[256];
+    ASSERT_GTE(closure_run(tmp, db, project, sizeof(project)), 0);
+
+    write_temp_file(tmp, "helper.c", "int helper(void) {\n    return 7;\n}\n");
+    int route = closure_run_repair_on(tmp, db);
+    closure_diff_t diff;
+    int verdict = closure_graph_vs_full(tmp, db, project, &diff);
+    th_rmtree(tmp);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    closure_report_diff(verdict, &diff);
+    ASSERT_EQ(verdict, 0);
+    PASS();
+}
+
+/* The same need without a new file: an existing file gains a definition whose
+ * name another file already calls. */
+TEST(pipeline_closure_repair_new_definition_in_existing_file) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_closure_def_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "a.c", "int once(int x) {\n    return x;\n}\n");
+    write_temp_file(tmp, "b.c", "int use_twice(int x) {\n    return twice(x);\n}\n");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/closure.db", tmp);
+    char project[256];
+    ASSERT_GTE(closure_run(tmp, db, project, sizeof(project)), 0);
+
+    write_temp_file(tmp, "a.c",
+                    "int once(int x) {\n    return x;\n}\n"
+                    "int twice(int x) {\n    return x + x;\n}\n");
+    int route = closure_run_repair_on(tmp, db);
+    closure_diff_t diff;
+    int verdict = closure_graph_vs_full(tmp, db, project, &diff);
+    th_rmtree(tmp);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    closure_report_diff(verdict, &diff);
+    ASSERT_EQ(verdict, 0);
+    PASS();
+}
+
+/* An include of a file that does not exist yet spells the file's own name,
+ * with its directory and extension, in a string and not in any definition. */
+TEST(pipeline_closure_repair_new_header_named_by_include) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_closure_inc_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "main.c",
+                    "#include \"lib/fresh.h\"\n\nint main(void) {\n    return 0;\n}\n");
+    write_temp_file(tmp, "other.c", "int other_value(void) {\n    return 3;\n}\n");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/closure.db", tmp);
+    char project[256];
+    ASSERT_GTE(closure_run(tmp, db, project, sizeof(project)), 0);
+
+    write_temp_file(tmp, "lib/fresh.h", "int fresh_limit(void) {\n    return 4;\n}\n");
+    int route = closure_run_repair_on(tmp, db);
+    closure_diff_t diff;
+    int verdict = closure_graph_vs_full(tmp, db, project, &diff);
+    th_rmtree(tmp);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    closure_report_diff(verdict, &diff);
+    ASSERT_EQ(verdict, 0);
+    PASS();
+}
+
+/* A base class named before it exists is bound from the class declaration,
+ * not from a call, so a list of call names alone would miss it. */
+TEST(pipeline_closure_repair_new_base_class_cpp) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_closure_basecls_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "d.cpp", "class D : public NewBase {\n};\n");
+    write_temp_file(tmp, "e.cpp", "int unrelated_value() {\n    return 5;\n}\n");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/closure.db", tmp);
+    char project[256];
+    ASSERT_GTE(closure_run(tmp, db, project, sizeof(project)), 0);
+
+    write_temp_file(tmp, "newbase.h",
+                    "class NewBase {\npublic:\n    int id() const {\n        return 1;\n    }\n};\n");
+    int route = closure_run_repair_on(tmp, db);
+    closure_diff_t diff;
+    int verdict = closure_graph_vs_full(tmp, db, project, &diff);
+    th_rmtree(tmp);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    closure_report_diff(verdict, &diff);
+    ASSERT_EQ(verdict, 0);
+    PASS();
+}
+
+/* A second language, so nothing rests on C: an import of a module that does
+ * not exist yet spells the module's name and nothing else about it. */
+TEST(pipeline_closure_repair_new_python_module_imported) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_closure_py_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "app.py",
+                    "from fresh_mod import helper\n\n\ndef run():\n    return helper()\n");
+    write_temp_file(tmp, "other.py", "def other_value():\n    return 3\n");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/closure.db", tmp);
+    char project[256];
+    ASSERT_GTE(closure_run(tmp, db, project, sizeof(project)), 0);
+
+    write_temp_file(tmp, "fresh_mod.py", "def helper():\n    return 1\n");
+    int route = closure_run_repair_on(tmp, db);
+    closure_diff_t diff;
+    int verdict = closure_graph_vs_full(tmp, db, project, &diff);
+    th_rmtree(tmp);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    closure_report_diff(verdict, &diff);
+    ASSERT_EQ(verdict, 0);
+    PASS();
+}
+
+/* Forty small C files, so the percentage check runs above the floor. The first
+ * n_first files call first_callee, the next n_second call second_callee, and
+ * the rest return a constant. Neither callee is defined anywhere. */
+static void closure_scale_repo(const char *tmp, const char *first_callee, int n_first,
+                               const char *second_callee, int n_second) {
+    for (int i = 0; i < 40; i++) {
+        char name[64];
+        char body[256];
+        snprintf(name, sizeof(name), "m_%02d.c", i);
+        if (i < n_first) {
+            snprintf(body, sizeof(body), "int m_%02d_fn(void) {\n    return %s();\n}\n", i,
+                     first_callee);
+        } else if (i < n_first + n_second) {
+            snprintf(body, sizeof(body), "int m_%02d_fn(void) {\n    return %s();\n}\n", i,
+                     second_callee);
+        } else {
+            snprintf(body, sizeof(body), "int m_%02d_fn(void) {\n    return %d;\n}\n", i, i);
+        }
+        write_temp_file(tmp, name, body);
+    }
+}
+
+/* Forty files make the budget 12. A new file nobody names repairs; a new file
+ * defining a function twenty of them call pulls in twenty-one files and the
+ * planner concedes to a full rebuild. */
+TEST(pipeline_closure_budget_reached_at_scale) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_closure_scale_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    closure_scale_repo(tmp, "shared_helper", 20, NULL, 0);
+    char db[512];
+    snprintf(db, sizeof(db), "%s/closure.db", tmp);
+    char project[256];
+    ASSERT_GTE(closure_run(tmp, db, project, sizeof(project)), 0);
+
+    write_temp_file(tmp, "fresh_unique.c", "int zq_fresh_only(void) {\n    return 1;\n}\n");
+    int fresh_route = closure_run_repair_on(tmp, db);
+    closure_diff_t diff;
+    int verdict = closure_graph_vs_full(tmp, db, project, &diff);
+
+    write_temp_file(tmp, "shared.c", "int shared_helper(void) {\n    return 0;\n}\n");
+    int common_route = closure_run_repair_on(tmp, db);
+    th_rmtree(tmp);
+    ASSERT_EQ(fresh_route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    closure_report_diff(verdict, &diff);
+    ASSERT_EQ(verdict, 0);
+    ASSERT_EQ(common_route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+    PASS();
+}
+
+/* A store whose surface rows carry no bloom cannot say who spells a name, so
+ * the first launch that adds one rebuilds, and that rebuild writes the blooms
+ * the next launch reads. */
+TEST(pipeline_closure_store_without_blooms_rebuilds_once) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_closure_nobloom_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "a.c", "int once(int x) {\n    return x;\n}\n");
+    write_temp_file(tmp, "b.c", "int use_once(int x) {\n    return once(x);\n}\n");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/closure.db", tmp);
+    char project[256];
+    ASSERT_GTE(closure_run(tmp, db, project, sizeof(project)), 0);
+
+    cbm_store_t *store = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(store);
+    int cleared = cbm_store_exec(store, "UPDATE lsp_surface SET ref_bloom = NULL;");
+    cbm_store_close(store);
+    ASSERT_EQ(cleared, CBM_STORE_OK);
+
+    write_temp_file(tmp, "one.c", "int bloom_one(void) {\n    return 1;\n}\n");
+    int first_route = closure_run_repair_on(tmp, db);
+    write_temp_file(tmp, "two.c", "int bloom_two(void) {\n    return 2;\n}\n");
+    int second_route = closure_run_repair_on(tmp, db);
+    closure_diff_t diff;
+    int verdict = closure_graph_vs_full(tmp, db, project, &diff);
+    th_rmtree(tmp);
+    ASSERT_EQ(first_route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+    ASSERT_EQ(second_route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    closure_report_diff(verdict, &diff);
+    ASSERT_EQ(verdict, 0);
+    PASS();
+}
+
+/* The added-name repair is off unless CBM_REPAIR_ADDED_NAMES=1. Set to 0, a
+ * new file and a new definition in an existing file each decline to a full
+ * rebuild. With the setting on, the next new file repairs, so the switch is
+ * the only thing that changed. */
+TEST(pipeline_closure_repair_added_names_off) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_closure_off_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "a.c", "int once(int x) {\n    return x;\n}\n");
+    write_temp_file(tmp, "b.c", "int use_once(int x) {\n    return once(x);\n}\n");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/closure.db", tmp);
+    char project[256];
+    ASSERT_GTE(closure_run(tmp, db, project, sizeof(project)), 0);
+
+    char *saved = closure_env_save("CBM_REPAIR_ADDED_NAMES");
+    cbm_setenv("CBM_REPAIR_ADDED_NAMES", "0", 1);
+    write_temp_file(tmp, "off_one.c", "int off_one(void) {\n    return 1;\n}\n");
+    int new_file_route = closure_run(tmp, db, NULL, 0);
+    write_temp_file(tmp, "a.c",
+                    "int once(int x) {\n    return x;\n}\n"
+                    "int off_extra(int x) {\n    return x + 2;\n}\n");
+    int new_definition_route = closure_run(tmp, db, NULL, 0);
+    closure_env_restore("CBM_REPAIR_ADDED_NAMES", saved);
+
+    write_temp_file(tmp, "off_two.c", "int off_two(void) {\n    return 2;\n}\n");
+    int restored_route = closure_run_repair_on(tmp, db);
+    closure_diff_t diff;
+    int verdict = closure_graph_vs_full(tmp, db, project, &diff);
+    th_rmtree(tmp);
+    ASSERT_EQ(new_file_route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+    ASSERT_EQ(new_definition_route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+    ASSERT_EQ(restored_route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    closure_report_diff(verdict, &diff);
+    ASSERT_EQ(verdict, 0);
+    PASS();
+}
+
+/* CBM_CLOSURE_BUDGET_PERCENT moves the line between repairing and rebuilding.
+ * Ten files call mid_a and ten call mid_b, so each new file's closure is 11
+ * of 41 or 42 files: inside the default 30% (the cutoff is 12), outside 5%
+ * (about 2 files, but the eight-file floor still applies and 11 clears it). A
+ * file nobody names would never reach the budget at any percentage, which is
+ * why these callees are named by ten files each. */
+TEST(pipeline_closure_budget_percent_setting) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_closure_pct_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    closure_scale_repo(tmp, "mid_a", 10, "mid_b", 10);
+    char db[512];
+    snprintf(db, sizeof(db), "%s/closure.db", tmp);
+    char project[256];
+    ASSERT_GTE(closure_run(tmp, db, project, sizeof(project)), 0);
+
+    char *saved = closure_env_save("CBM_CLOSURE_BUDGET_PERCENT");
+    cbm_setenv("CBM_CLOSURE_BUDGET_PERCENT", "5", 1);
+    write_temp_file(tmp, "mid_a.c", "int mid_a(void) {\n    return 1;\n}\n");
+    int tight_route = closure_run_repair_on(tmp, db);
+    closure_env_restore("CBM_CLOSURE_BUDGET_PERCENT", saved);
+
+    write_temp_file(tmp, "mid_b.c", "int mid_b(void) {\n    return 2;\n}\n");
+    int default_route = closure_run_repair_on(tmp, db);
+    closure_diff_t diff;
+    int verdict = closure_graph_vs_full(tmp, db, project, &diff);
+    th_rmtree(tmp);
+    ASSERT_EQ(tight_route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+    ASSERT_EQ(default_route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    closure_report_diff(verdict, &diff);
+    ASSERT_EQ(verdict, 0);
+    PASS();
+}
+
 TEST(pipeline_incremental_tsconfig_alias_change_matches_fresh_full) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_ref_tsconfig_incr_XXXXXX");
@@ -14893,6 +15338,16 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(pipeline_closure_repair_added_name_declines_to_full);
     RUN_TEST(pipeline_closure_repair_new_file_declines_to_full);
     RUN_TEST(pipeline_closure_repair_budget_declines_to_full);
+    RUN_TEST(pipeline_closure_repair_baseline_body_edit_equals_full);
+    RUN_TEST(pipeline_closure_repair_new_file_named_by_a_call);
+    RUN_TEST(pipeline_closure_repair_new_definition_in_existing_file);
+    RUN_TEST(pipeline_closure_repair_new_header_named_by_include);
+    RUN_TEST(pipeline_closure_repair_new_base_class_cpp);
+    RUN_TEST(pipeline_closure_repair_new_python_module_imported);
+    RUN_TEST(pipeline_closure_budget_reached_at_scale);
+    RUN_TEST(pipeline_closure_store_without_blooms_rebuilds_once);
+    RUN_TEST(pipeline_closure_repair_added_names_off);
+    RUN_TEST(pipeline_closure_budget_percent_setting);
     RUN_TEST(pipeline_incremental_tsconfig_alias_change_matches_fresh_full);
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
     RUN_TEST(pipeline_publication_stamps_full_and_delta_generations);

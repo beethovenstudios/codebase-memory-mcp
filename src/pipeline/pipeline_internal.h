@@ -171,6 +171,29 @@ void cbm_pipeline_result_release(CBMFileResult *r, bool loaded);
 /* Log the store counters, close and delete the store, drop the latch. */
 void cbm_pipeline_spill_close(cbm_pipeline_ctx_t *ctx);
 
+/* ── Containment structure ────────────────────────────────────────────
+ * The nodes and edges that put a file in the tree: Project, Branch, Folder
+ * and File nodes, HAS_BRANCH, CONTAINS_FOLDER and CONTAINS_FILE. The full
+ * build creates them for every file; a repair that adds a file creates them
+ * for that file through the same two functions, so the two graphs cannot
+ * drift apart. Both write into `gbuf` only. A node that already exists in
+ * `gbuf` (a Folder an earlier file created, or a proxy of one already stored)
+ * is found by its qualified name and not duplicated. */
+
+/* The qualified name containment hangs root-level files from: the branch node
+ * when the repository has a git context, else the project node. */
+const char *cbm_pipeline_structure_root_qn(const cbm_pipeline_t *p);
+
+/* Project and (when there is a branch) Branch nodes with the HAS_BRANCH edge. */
+void cbm_pipeline_structure_roots(const cbm_pipeline_t *p, cbm_gbuf_t *gbuf);
+
+/* `seen_dirs` is a set the caller creates empty, passes to every call of one
+ * batch (it remembers which directory chains are already built) and releases
+ * with cbm_pipeline_structure_seen_free. */
+void cbm_pipeline_structure_file(cbm_gbuf_t *gbuf, const char *project, const char *root_qn,
+                                 const char *rel_path, CBMHashTable *seen_dirs);
+void cbm_pipeline_structure_seen_free(CBMHashTable *seen_dirs);
+
 /* Transcode an ObjectScript Studio Export XML file and compose every generated
  * UDL class into one cacheable result. The returned result owns all child
  * extraction arenas and is released with the ordinary cbm_free_result(). */
