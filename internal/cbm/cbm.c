@@ -25,6 +25,7 @@
 #include "preprocessor.h"
 #include "sql_values.h" // #1735: literal INSERT rows kept out of the SQL parse
 #include "cpp_branch_views.h"
+#include "ref_bloom.h" // cbm_ref_bloom_of_result -- referenced-name bloom on the result
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"  // cbm_fopen — crash-supervisor per-file marker write
 #include "foundation/hash_table.h" // CBMHashTable — crash-supervisor quarantine set
@@ -4563,6 +4564,9 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
     // Retain tree for cross-file LSP reuse (caller frees via cbm_free_tree)
     result->cached_tree = tree;
     result->cached_lang = language;
+    // Referenced-name bloom, built while the tree is still attached: the
+    // incremental pass reads it to find files that mention a newly added name.
+    cbm_ref_bloom_of_result(result, source, source_len);
     cbm_index_mark_done(rel_path);
     return result;
 }

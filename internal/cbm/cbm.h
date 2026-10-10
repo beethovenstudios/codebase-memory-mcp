@@ -949,6 +949,12 @@ typedef struct CBMFileResult {
      * bytes; NULL for languages without a scope scanner. */
     CBMDocLinkArray doc_links;
     const char *doc_scope;
+    // Referenced-name bloom: a small filter over every identifier the file's
+    // code mentions (comments excluded), kept in `arena`. A name the filter
+    // answers "no" for is certainly not referenced; "yes" may be a false
+    // positive. NULL, with length 0, when none was built.
+    const unsigned char *ref_bloom;
+    int ref_bloom_len;
 } CBMFileResult;
 
 // --- Enclosing function cache ---

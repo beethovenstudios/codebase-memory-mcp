@@ -504,8 +504,21 @@ static void surface_row_one(int i, void *arg) {
     char *json =
         surface_file_to_json(fr, job->files[i].language, job->files[i].rel_path,
                              job->all_defs ? job->all_defs + start : NULL, end - start, &json_len);
+    /* The row keeps its own heap copy of the referenced-name bloom: the
+     * result (and its arena) is released just below. A result without a
+     * bloom leaves the row's bloom NULL. */
+    int bloom_len = fr->ref_bloom_len;
+    void *bloom_copy = NULL;
+    if (json && fr->ref_bloom && bloom_len > 0) {
+        bloom_copy = malloc((size_t)bloom_len);
+        if (bloom_copy) {
+            memcpy(bloom_copy, fr->ref_bloom, (size_t)bloom_len);
+        }
+    }
+    bool bloom_failed = fr->ref_bloom && bloom_len > 0 && !bloom_copy;
     cbm_pipeline_result_release(fr, loaded);
-    if (!json) {
+    if (!json || bloom_failed) {
+        free(json);
         atomic_store_explicit(&job->failed, true, memory_order_relaxed);
         return;
     }
@@ -516,8 +529,8 @@ static void surface_row_one(int i, void *arg) {
     r->project = strdup(job->project);
     r->rel_path = strdup(job->files[i].rel_path);
     r->surface_sha = strdup(sha);
-    r->ref_bloom = NULL;
-    r->ref_bloom_len = 0;
+    r->ref_bloom = bloom_copy;
+    r->ref_bloom_len = bloom_copy ? bloom_len : 0;
     r->config_ctx = strdup("");
     if (!r->project || !r->rel_path || !r->surface_sha || !r->config_ctx) {
         atomic_store_explicit(&job->failed, true, memory_order_relaxed);
