@@ -1689,19 +1689,43 @@ static int surface_removed_names(const char *stored_json, const char *fresh_json
     return walk.failed ? CBM_NOT_FOUND : 0;
 }
 
-/* The doc-link view of one changed (fresh_json set) or deleted (fresh_json
- * NULL) file: the names it no longer declares go to `removed`. false when the
- * change cannot be repaired file by file (the rules above) or the stored data
- * cannot be read -- either way the caller declines. */
+/* The two name sets a scope delta reports into. */
+typedef struct {
+    CBMHashTable *removed;
+    CBMHashTable *added;
+} scope_names_t;
+
+static bool scope_removed_put(void *ud, const char *name, size_t len) {
+    return name_set_add_n(((scope_names_t *)ud)->removed, name, len);
+}
+
+static bool scope_added_put(void *ud, const char *name, size_t len) {
+    return name_set_add_n(((scope_names_t *)ud)->added, name, len);
+}
+
+/* The doc-link view of one changed (both set), new (stored_json NULL) or
+ * deleted (fresh_json NULL) file: the names it no longer declares go to
+ * `removed`. With `added` (the added-name repair is on) the names it gains go
+ * there, and a scope that appears with a new file or leaves with a deleted one
+ * is judged record by record (cbm_doclinks_scope_delta_additive): a gained
+ * declaration needs no full rebuild, because the files that spell its name,
+ * in code or in a doc comment, are re-resolved by the bloom pass and by the
+ * unresolved doc-link rows. Without `added`, a scope that appears, leaves, or
+ * gains a record is GLOBAL, as the engine always judged it. false when the
+ * change cannot be repaired file by file or the stored data cannot be read --
+ * either way the caller declines. */
 static bool doc_scope_repairable(const char *stored_json, const char *fresh_json,
-                                 CBMHashTable *removed) {
+                                 CBMHashTable *removed, CBMHashTable *added) {
     char *stored_dl = NULL;
     char *fresh_dl = NULL;
+    scope_names_t names = {.removed = removed, .added = added};
     bool ok = surface_dl_scope(stored_json, &stored_dl) &&
               (!fresh_json || surface_dl_scope(fresh_json, &fresh_dl)) &&
-              cbm_doclinks_scope_delta(stored_dl, fresh_dl, removed_name_put, removed) ==
+              (added ? cbm_doclinks_scope_delta_additive(stored_dl, fresh_dl, scope_removed_put,
+                                                         scope_added_put, &names)
+                     : cbm_doclinks_scope_delta(stored_dl, fresh_dl, removed_name_put, removed)) ==
                   CBM_DOCLINK_DELTA_LOCAL &&
-              surface_removed_names(stored_json, fresh_json, removed) == 0;
+              (!stored_json || surface_removed_names(stored_json, fresh_json, removed) == 0);
     cbm_free(CBM_MEM_CLASS_OTHER, stored_dl);
     cbm_free(CBM_MEM_CLASS_OTHER, fresh_dl);
     return ok;
@@ -3181,11 +3205,13 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
              * reference resolves to. Nothing stored points at a file that did
              * not exist, so it seeds no edge query; the bloom pass below
              * finds who spells these. */
-            why = closure_python_namespace_decline(fresh_row->defs_json, NULL);
-            if (why) {
-                break;
-            }
-            if (!doc_scope_repairable(fresh_row->defs_json, NULL, removed_names)) {
+            /* No Python namespace decline: the decline protects importers whose
+             * bindings follow a file's STORED namespace facts, and nothing
+             * stored follows a file that did not exist. The files that may now
+             * import it are found by name below (its definitions and its base
+             * name go to the bloom pass). A doc-link scope it brings is judged
+             * by its records, as a gained declaration. */
+            if (!doc_scope_repairable(NULL, fresh_row->defs_json, removed_names, added_names)) {
                 why = "doc_scope_changed";
                 break;
             }
@@ -3231,7 +3257,7 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
             (!repair_added_names && cbm_ht_count(added_names) != names_before)) {
             why = "added_definition_names";
         } else if (!doc_scope_repairable(stored_row->defs_json, fresh_row->defs_json,
-                                         removed_names)) {
+                                         removed_names, repair_added_names ? added_names : NULL)) {
             why = "doc_scope_changed";
         } else {
             n_surface_changed++;
@@ -3246,7 +3272,8 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
             break;
         }
         dep_targets[dep_target_count++] = changed_paths[n_changed + i];
-        if (gone && !doc_scope_repairable(gone->defs_json, NULL, removed_names)) {
+        if (gone && !doc_scope_repairable(gone->defs_json, NULL, removed_names,
+                                          repair_added_names ? added_names : NULL)) {
             gone_scope_changed = true;
         }
     }
@@ -3405,6 +3432,9 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
     /* Files whose unresolved doc-link references name something a changed or
      * deleted file no longer declares re-resolve too. */
     doc_row_name_dependents(plan->doc_rows, plan->doc_row_count, removed_names, row_deps);
+    /* ...and files whose unresolved references name something the delta
+     * gained: they may resolve now. */
+    doc_row_name_dependents(plan->doc_rows, plan->doc_row_count, added_names, row_deps);
     {
         row_dep_walk_t walk = {.closure = closure_set, .files = files_by_path, .added = 0};
         cbm_ht_foreach(row_deps, row_dep_visitor, &walk);

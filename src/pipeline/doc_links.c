@@ -132,9 +132,13 @@ static bool scope_next_line(const char **p, const char **line, size_t *len) {
     return true;
 }
 
-int cbm_doclinks_scope_delta_lines(const char *stored, const char *fresh,
-                                   cbm_doclink_removable_fn removable, cbm_doclink_name_fn removed,
-                                   void *ud) {
+/* The line walk behind cbm_doclinks_scope_delta_lines (declares and added
+ * NULL: a record only the fresh blob has is GLOBAL) and
+ * cbm_doclinks_scope_delta_additive (a gained record that declares a name goes
+ * to `added` and is LOCAL). */
+static int scope_delta_walk(const char *stored, const char *fresh,
+                            cbm_doclink_removable_fn removable, cbm_doclink_removable_fn declares,
+                            cbm_doclink_name_fn removed, cbm_doclink_name_fn added, void *ud) {
     const char *sp = stored;
     const char *fp = fresh;
     const char *sl = NULL;
@@ -151,6 +155,18 @@ int cbm_doclinks_scope_delta_lines(const char *stored, const char *fresh,
         }
         const char *name = NULL;
         size_t nlen = 0;
+        /* A record only the fresh blob has: a declared name is added (a changed
+         * record is its old form dropped, handled below, and its new form
+         * gained, handled here). */
+        if (hf && declares && added && declares(fl, flen, &name, &nlen) && nlen > 0) {
+            if (!added(ud, name, nlen)) {
+                return CBM_NOT_FOUND;
+            }
+            hf = scope_next_line(&fp, &fl, &flen);
+            continue;
+        }
+        name = NULL;
+        nlen = 0;
         if (!hs || !removable(sl, slen, &name, &nlen) || nlen == 0) {
             return CBM_DOCLINK_DELTA_GLOBAL; /* new, changed, or resolved through */
         }
@@ -160,6 +176,49 @@ int cbm_doclinks_scope_delta_lines(const char *stored, const char *fresh,
         hs = scope_next_line(&sp, &sl, &slen);
     }
     return CBM_DOCLINK_DELTA_LOCAL;
+}
+
+int cbm_doclinks_scope_delta_lines(const char *stored, const char *fresh,
+                                   cbm_doclink_removable_fn removable, cbm_doclink_name_fn removed,
+                                   void *ud) {
+    return scope_delta_walk(stored, fresh, removable, NULL, removed, NULL, ud);
+}
+
+int cbm_doclinks_scope_delta_additive(const char *stored, const char *fresh,
+                                      cbm_doclink_name_fn removed, cbm_doclink_name_fn added,
+                                      void *ud) {
+    if (!stored && !fresh) {
+        return CBM_DOCLINK_DELTA_LOCAL;
+    }
+    /* A blob that appears or leaves with its file is judged against its own
+     * tag line: every record is gained, or dropped. */
+    char tag[CBM_SZ_64];
+    if (!stored || !fresh) {
+        const char *blob = stored ? stored : fresh;
+        const char *nl = strchr(blob, '\n');
+        size_t tl = nl ? (size_t)(nl - blob) : strlen(blob);
+        if (tl == 0 || tl >= sizeof(tag)) {
+            return CBM_DOCLINK_DELTA_GLOBAL;
+        }
+        memcpy(tag, blob, tl);
+        tag[tl] = '\0';
+        if (stored) {
+            fresh = tag;
+        } else {
+            stored = tag;
+        }
+    }
+    const cbm_doclink_resolver_t *R = resolver_of_scope(stored);
+    if (!R || R != resolver_of_scope(fresh)) {
+        return CBM_DOCLINK_DELTA_GLOBAL;
+    }
+    if (R->removable && R->declares && added) {
+        return scope_delta_walk(stored, fresh, R->removable, R->declares, removed, added, ud);
+    }
+    if (stored == tag || fresh == tag || !R->scope_delta) {
+        return CBM_DOCLINK_DELTA_GLOBAL; /* no line predicates: appears or leaves = GLOBAL */
+    }
+    return R->scope_delta(stored, fresh, removed, ud);
 }
 
 bool cbm_doclinks_scope_field(const char *line, size_t len, int k, const char **field,

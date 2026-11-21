@@ -265,6 +265,20 @@ static void add_result_tokens(CBMHashTable *set, const CBMFileResult *r) {
     }
 }
 
+/* Every doc-comment or document reference the file writes (CBMDocLink.raw: a
+ * name, a Type::member, a path). The code tokens above leave comments out, but
+ * the doc-link layer resolves these against the declarations of other files, so
+ * a declaration gained elsewhere can re-route them: a file must answer "maybe"
+ * for a name its doc references spell, resolved or not. */
+static void add_doc_link_tokens(CBMHashTable *set, const CBMFileResult *r) {
+    for (int i = 0; i < r->doc_links.count; i++) {
+        const char *raw = r->doc_links.items[i].raw;
+        if (raw) {
+            cbm_ref_tokens_add_text(set, raw, strlen(raw));
+        }
+    }
+}
+
 static void free_key(const char *key, void *value, void *userdata) {
     (void)value;
     (void)userdata;
@@ -291,6 +305,7 @@ void cbm_ref_bloom_of_result(CBMFileResult *result, const char *source, int sour
     } else {
         add_result_tokens(set, result);
     }
+    add_doc_link_tokens(set, result);
     int len = 0;
     const unsigned char *blob = cbm_ref_bloom_from_tokens(&result->arena, set, &len);
     if (blob) {

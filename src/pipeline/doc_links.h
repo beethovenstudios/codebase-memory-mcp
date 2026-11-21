@@ -222,6 +222,15 @@ typedef struct {
     bool (*scope_input)(const char *rel_path);
     int (*scope_delta)(const char *stored, const char *fresh, cbm_doclink_name_fn removed,
                        void *ud);
+    /* Optional, together, for a language whose scope_delta is
+     * cbm_doclinks_scope_delta_lines: the two line predicates it reads the
+     * blob by. removable: a record that declares one name and nothing others
+     * resolve THROUGH. declares: a record that declares a name whether or not
+     * others resolve through it (a type, a supertype, a member, a function).
+     * With them, cbm_doclinks_scope_delta_additive can judge a blob that gains
+     * records, appears with a new file or leaves with a deleted one. */
+    bool (*removable)(const char *line, size_t len, const char **name, size_t *name_len);
+    bool (*declares)(const char *line, size_t len, const char **name, size_t *name_len);
     /* Optional, together: whether the reader takes a scope blob written in
      * this run (1), refuses it (0), or could not tell for memory (-1); and
      * the marker stored instead of a refused blob (a memory-core block of
@@ -312,6 +321,19 @@ bool cbm_doclinks_is_scope_input(const char *rel_path);
  * language is GLOBAL; otherwise the language's scope_delta hook decides. */
 int cbm_doclinks_scope_delta(const char *stored, const char *fresh, cbm_doclink_name_fn removed,
                              void *ud);
+
+/* cbm_doclinks_scope_delta for a caller that repairs added names by name
+ * (CBM_REPAIR_ADDED_NAMES): a record the fresh blob gained that the language
+ * says declares a name is LOCAL, and its name goes to `added`, because every
+ * file that spells the name (in code or in a doc comment, resolved or not) is
+ * found by the referenced-name blooms and the unresolved doc-link rows and
+ * re-resolved with the closure. A blob that appears with a new file, or leaves
+ * with a deleted one, is judged the same way against its own tag line. A
+ * record that only changes how others resolve (an import, a namespace) is
+ * still GLOBAL, as is every language without the line predicates. */
+int cbm_doclinks_scope_delta_additive(const char *stored, const char *fresh,
+                                      cbm_doclink_name_fn removed, cbm_doclink_name_fn added,
+                                      void *ud);
 
 /* A record of a scope blob that declares one name other files may reference
  * and nothing others resolve THROUGH: true, with that name. */

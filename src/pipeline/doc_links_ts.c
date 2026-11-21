@@ -1105,4 +1105,6 @@ const cbm_doclink_resolver_t cbm_doclink_ts_resolver = {
     .destroy = tr_destroy,
     .resolve = tr_resolve,
     .scope_delta = tr_scope_delta,
+    .removable = tr_removable,
+    .declares = tr_removable,
 };

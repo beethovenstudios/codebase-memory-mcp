@@ -10486,6 +10486,49 @@ TEST(doc_mentions_alloc_failure_status) {
     PASS();
 }
 
+/* The added-name repair judges a gained declaration by its name instead of
+ * calling it GLOBAL: the names go to `added`, a record that only changes how
+ * others resolve stays GLOBAL, and a scope that appears with a new file or
+ * leaves with a deleted one is judged against its own tag line. */
+TEST(doc_mentions_scope_delta_additive) {
+    const char *base = "c1\nD\tf\t0\tfoo\tp.foo\t\n";
+    const char *gains_fn = "c1\nD\tf\t0\tfoo\tp.foo\t\nD\tf\t0\tbar\tp.bar\t\n";
+    const char *gains_type = "c1\nD\tf\t0\tfoo\tp.foo\t\nD\tt\t0\tShape\tp.Shape\t\n";
+    dm_names_t removed = {{0}};
+    dm_names_t added = {{0}};
+    /* upstream's rule is unchanged: a gained record is GLOBAL */
+    ASSERT_EQ(cbm_doclinks_scope_delta(base, gains_fn, dm_name_put, &removed),
+              CBM_DOCLINK_DELTA_GLOBAL);
+    /* with the repair, a gained function or type is LOCAL and reports its name */
+    ASSERT_EQ(cbm_doclinks_scope_delta_additive(base, gains_fn, dm_name_put, dm_name_put, &added),
+              CBM_DOCLINK_DELTA_LOCAL);
+    ASSERT_STR_EQ(added.names, "bar");
+    memset(&added, 0, sizeof(added));
+    ASSERT_EQ(cbm_doclinks_scope_delta_additive(base, gains_type, dm_name_put, dm_name_put, &added),
+              CBM_DOCLINK_DELTA_LOCAL);
+    ASSERT_STR_EQ(added.names, "Shape");
+    /* a new file's whole blob is gained; a deleted file's is dropped (functions
+     * only: a type is resolved through, so its removal stays GLOBAL) */
+    memset(&added, 0, sizeof(added));
+    ASSERT_EQ(cbm_doclinks_scope_delta_additive(NULL, gains_fn, dm_name_put, dm_name_put, &added),
+              CBM_DOCLINK_DELTA_LOCAL);
+    ASSERT_STR_EQ(added.names, "foo,bar");
+    ASSERT_EQ(cbm_doclinks_scope_delta_additive(gains_fn, NULL, dm_name_put, dm_name_put, &removed),
+              CBM_DOCLINK_DELTA_LOCAL);
+    ASSERT_STR_EQ(removed.names, "foo,bar");
+    ASSERT_EQ(
+        cbm_doclinks_scope_delta_additive(gains_type, NULL, dm_name_put, dm_name_put, &removed),
+        CBM_DOCLINK_DELTA_GLOBAL);
+    /* no scope before and after: a language without one */
+    ASSERT_EQ(cbm_doclinks_scope_delta_additive(NULL, NULL, dm_name_put, dm_name_put, &added),
+              CBM_DOCLINK_DELTA_LOCAL);
+    /* a blob no resolver claims is never repaired file by file */
+    ASSERT_EQ(cbm_doclinks_scope_delta_additive(NULL, "zz9\nM\t0\tc\t0\tW.Run\t\tint\n",
+                                                dm_name_put, dm_name_put, &added),
+              CBM_DOCLINK_DELTA_GLOBAL);
+    PASS();
+}
+
 SUITE(doc_mentions) {
     RUN_TEST(doc_mentions_extract_cs_tokens);
     RUN_TEST(doc_mentions_cs_scope_blob);
@@ -10509,6 +10552,7 @@ SUITE(doc_mentions) {
     RUN_TEST(doc_mentions_index_status_preview_order);
     RUN_TEST(doc_mentions_index_status_preview_failure);
     RUN_TEST(doc_mentions_scope_delta_rules);
+    RUN_TEST(doc_mentions_scope_delta_additive);
     RUN_TEST(doc_mentions_incremental_equals_full);
     RUN_TEST(doc_mentions_parallel_equals_sequential);
     RUN_TEST(doc_mentions_cs_scan_dollar_run);

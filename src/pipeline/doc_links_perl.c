@@ -501,4 +501,6 @@ const cbm_doclink_resolver_t cbm_doclink_perl_resolver = {
     .destroy = pr_destroy,
     .resolve = pr_resolve,
     .scope_delta = pl_scope_delta,
+    .removable = pl_removable,
+    .declares = pl_removable,
 };

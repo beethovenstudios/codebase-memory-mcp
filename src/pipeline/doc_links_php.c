@@ -978,6 +978,25 @@ static bool pr_removable(const char *line, size_t len, const char **name, size_t
     return true;
 }
 
+/* Besides what pr_removable names: a type (T kind fqn ...) and a supertype of
+ * the type above it (B kind name) declare the name they spell. */
+static bool pr_declares(const char *line, size_t len, const char **name, size_t *nlen) {
+    if (len > PAIR_LEN && line[1] == '\t' && (line[0] == 'T' || line[0] == 'B')) {
+        if (!cbm_doclinks_scope_field(line, len, PAIR_LEN, name, nlen)) {
+            return false;
+        }
+        for (size_t i = *nlen; i > 0; i--) {
+            if ((*name)[i - SKIP_ONE] == '\\') {
+                *nlen -= i;
+                *name += i;
+                break;
+            }
+        }
+        return true;
+    }
+    return pr_removable(line, len, name, nlen);
+}
+
 static int pr_scope_delta(const char *stored, const char *fresh, cbm_doclink_name_fn removed,
                           void *ud) {
     return cbm_doclinks_scope_delta_lines(stored, fresh, pr_removable, removed, ud);
@@ -991,4 +1010,6 @@ const cbm_doclink_resolver_t cbm_doclink_php_resolver = {
     .destroy = pr_destroy,
     .resolve = pr_resolve,
     .scope_delta = pr_scope_delta,
+    .removable = pr_removable,
+    .declares = pr_declares,
 };

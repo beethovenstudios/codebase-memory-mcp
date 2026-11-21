@@ -487,6 +487,18 @@ static bool cr_removable(const char *line, size_t len, const char **name, size_t
            cbm_doclinks_scope_field(line, len, CBM_SZ_3, name, nlen);
 }
 
+/* Every D record (a type too) and every Doxygen anchor declares a name: a
+ * record gained by an incremental repair is found by the name it spells. */
+static bool cr_declares(const char *line, size_t len, const char **name, size_t *nlen) {
+    if (len <= PAIR_LEN || line[1] != '\t') {
+        return false;
+    }
+    if (line[0] == 'A') {
+        return cbm_doclinks_scope_field(line, len, 1, name, nlen);
+    }
+    return line[0] == 'D' && cbm_doclinks_scope_field(line, len, CBM_SZ_3, name, nlen);
+}
+
 static int cr_scope_delta(const char *stored, const char *fresh, cbm_doclink_name_fn removed,
                           void *ud) {
     return cbm_doclinks_scope_delta_lines(stored, fresh, cr_removable, removed, ud);
@@ -500,4 +512,6 @@ const cbm_doclink_resolver_t cbm_doclink_c_resolver = {
     .destroy = cr_destroy,
     .resolve = cr_resolve,
     .scope_delta = cr_scope_delta,
+    .removable = cr_removable,
+    .declares = cr_declares,
 };
