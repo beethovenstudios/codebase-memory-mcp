@@ -1350,6 +1350,33 @@ TEST(extract_c_member_declarators_name_and_type) {
     PASS();
 }
 
+/* One member declaration, several declarators: each is its own Field with its
+ * own type text. `int a, b;` once registered `a` alone, and a structured
+ * binding over the struct then read past the field array. */
+TEST(extract_cpp_one_field_per_declarator) {
+    CBMFileResult *r = extract("struct Many {\n"
+                               "    int a, b;\n"
+                               "    std::string x, y, z;\n"
+                               "    int *p, q[4], &r;\n"
+                               "    unsigned lo : 1, hi : 2;\n"
+                               "};\n",
+                               CBM_LANG_CPP, "t", "many.hpp");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(count_defs_with_label(r, "Field"), 12);
+    ASSERT_STR_EQ(def_return_type(r, "a"), "int");
+    ASSERT_STR_EQ(def_return_type(r, "b"), "int");
+    ASSERT_STR_EQ(def_return_type(r, "x"), "std::string");
+    ASSERT_STR_EQ(def_return_type(r, "y"), "std::string");
+    ASSERT_STR_EQ(def_return_type(r, "z"), "std::string");
+    ASSERT_STR_EQ(def_return_type(r, "p"), "int *");
+    ASSERT_STR_EQ(def_return_type(r, "q"), "int [4]");
+    ASSERT_STR_EQ(def_return_type(r, "r"), "int &");
+    ASSERT_STR_EQ(def_return_type(r, "lo"), "unsigned");
+    ASSERT_STR_EQ(def_return_type(r, "hi"), "unsigned");
+    cbm_free_result(r);
+    PASS();
+}
+
 /* PR #1245: the C grammar splits a declared return type across the `type` node,
  * sibling type_qualifier nodes and the pointer_declarator chain wrapping the
  * function declarator. Taking only the `type` node published `const char *` as
@@ -12417,6 +12444,7 @@ SUITE(extraction) {
     RUN_TEST(extract_c_anonymous_typedef_aggregate_is_one_def);
     RUN_TEST(extract_c_function_pointer_member_is_a_field);
     RUN_TEST(extract_c_member_declarators_name_and_type);
+    RUN_TEST(extract_cpp_one_field_per_declarator);
     RUN_TEST(cpp_class);
     RUN_TEST(cpp_method_return_type_preserves_pointer_and_qualifier);
 

@@ -2147,6 +2147,26 @@ TEST(clsp_structured_binding_more_names_than_fields) {
     PASS();
 }
 
+/* A struct whose members share declarations (`A p, q;`) binds every name of
+ * `auto [p, q, r] = s;` to its own member type. */
+TEST(clsp_structured_binding_multi_declarator_fields) {
+    CBMFileResult *r = extract_cpp("struct A { void fa() {} };\n"
+                                   "struct B { void fb() {} };\n"
+                                   "struct S { A p, q; B r; };\n"
+                                   "void test() {\n"
+                                   "    S s;\n"
+                                   "    auto [p, q, r] = s;\n"
+                                   "    p.fa();\n"
+                                   "    q.fa();\n"
+                                   "    r.fb();\n"
+                                   "}\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(count_resolved(r, "test", "A.fa"), 2);
+    ASSERT_GTE(find_resolved(r, "test", "B.fb"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(clsp_ternary_type) {
     CBMFileResult *r = extract_cpp("\n"
                                    "class Widget {\n"
@@ -17210,6 +17230,7 @@ SUITE(c_lsp) {
     RUN_TEST(clsp_structured_binding_pair);
     RUN_TEST(clsp_structured_binding_struct);
     RUN_TEST(clsp_structured_binding_more_names_than_fields);
+    RUN_TEST(clsp_structured_binding_multi_declarator_fields);
     RUN_TEST(clsp_ternary_type);
     RUN_TEST(clsp_chained_method_calls);
     RUN_TEST(clsp_std_vector_push_back);
