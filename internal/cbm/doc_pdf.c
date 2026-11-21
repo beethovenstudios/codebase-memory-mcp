@@ -1334,8 +1334,9 @@ static const char *page_doc(CBMArena *a, const cbm_pdf_page_t *pg) {
     while (cut > 0 && ((unsigned char)pg->text[cut] & 0xC0U) == 0x80U) {
         cut--; /* not inside a UTF-8 sequence */
     }
-    const char *doc = cbm_arena_sprintf(a, "%.*s\n[page text cut at %zu of %zu bytes]", (int)cut,
-                                        pg->text, cut, pg->len);
+    const char *doc = cbm_arena_sprintf(a, "%.*s\n[page text cut at %llu of %llu bytes]", (int)cut,
+                                        pg->text, (unsigned long long)cut,
+                                        (unsigned long long)pg->len);
     return doc ? doc : pg->text;
 }
 
